@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -26,6 +27,64 @@ __version__ = "1.0.0"
 HERE = Path(__file__).resolve().parent
 FLEET_HOME = Path(os.environ.get("FLEET_HOME", Path.home() / ".fleet"))
 COMPLEXITIES = ["trivial", "low", "medium", "high", "extreme"]
+
+SESSIONS_LOCK = threading.Lock()
+
+
+def sessions_path():
+    return FLEET_HOME / "sessions.json"
+
+
+def load_sessions():
+    p = sessions_path()
+    if p.is_file():
+        try:
+            return json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_sessions(data):
+    FLEET_HOME.mkdir(parents=True, exist_ok=True)
+    tmp = sessions_path().with_name("sessions.json.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(sessions_path())
+
+
+def parse_codex_thread_id(stdout):
+    """codex --json emits a thread.started event carrying the thread id."""
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        tid = o.get("thread_id") or (o.get("thread") or {}).get("id")
+        if tid:
+            return tid
+    return None
+
+
+def codex_text_from_events(stdout):
+    """Last assistant message out of the JSONL event stream."""
+    texts = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if o.get("type") == "item.completed":
+            item = o.get("item") or {}
+            if item.get("item_type") == "assistant_message" and item.get("text"):
+                texts.append(item["text"])
+    return texts[-1] if texts else ""
+
 
 AUTH_FIX = {
     "claude": "run `claude` interactively once, or `claude auth login`",
@@ -136,14 +195,20 @@ def resolve_model(roster, key):
 
 # ------------------------------------------------------------- execution ----
 
-def build_cmd(roster, model, cwd, effort, readonly, yolo, outfile):
+def build_cmd(roster, model, cwd, effort, readonly, yolo, outfile, session=None):
+    """session: None, {} for a brand-new named session, or a dict with native_id."""
     backend = model["backend"]
     exe = backend_bin(roster, backend)
     if not exe:
         return None, "backend %s is not installed - run `fleet doctor` to see what resolves" % backend
+    resume_id = (session or {}).get("native_id")
 
     if backend == "claude":
         cmd = [exe, "-p", "--model", model["id"], "--output-format", "json"]
+        if resume_id:
+            cmd += ["--resume", resume_id]
+        elif session is not None:
+            cmd += ["--session-id", session.setdefault("native_id", str(uuid.uuid4()))]
         if effort:
             cmd += ["--effort", effort]
         if readonly:
@@ -157,16 +222,27 @@ def build_cmd(roster, model, cwd, effort, readonly, yolo, outfile):
         return cmd, None
 
     if backend == "codex":
-        cmd = [exe, "exec", "-", "-m", model["id"], "-C", cwd,
-               "--skip-git-repo-check", "-o", outfile]
+        sandbox = "read-only" if readonly else "workspace-write"
+        if resume_id:
+            # `exec resume` takes a smaller flag set: no -s and no -C, so the
+            # sandbox goes through a config override and cwd via the subprocess.
+            cmd = [exe, "exec", "resume", resume_id, "-", "-m", model["id"],
+                   "--skip-git-repo-check", "--json", "-o", outfile]
+            if not readonly and yolo:
+                cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+            else:
+                cmd += ["-c", 'sandbox_mode="%s"' % sandbox]
+        else:
+            cmd = [exe, "exec", "-", "-m", model["id"], "-C", cwd,
+                   "--skip-git-repo-check", "--json", "-o", outfile]
+            if readonly:
+                cmd += ["-s", sandbox]
+            elif yolo:
+                cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+            else:
+                cmd += ["-s", sandbox]
         if effort:
             cmd += ["-c", "model_reasoning_effort=%s" % effort]
-        if readonly:
-            cmd += ["-s", "read-only"]
-        elif yolo:
-            cmd += ["--dangerously-bypass-approvals-and-sandbox"]
-        else:
-            cmd += ["-s", "workspace-write"]
         return cmd, None
 
     return None, "unknown backend %s" % backend
@@ -180,6 +256,9 @@ def extract_text(backend, stdout, outfile):
                 return txt
         except OSError:
             pass
+        from_events = codex_text_from_events(stdout)
+        if from_events:
+            return from_events
         return stdout.strip()[-8000:]
     # claude --output-format json
     try:
@@ -216,12 +295,40 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
                                 prefer=task.get("prefer", prefer),
                                 avoid_backend=task.get("avoid_backend"))
     model = roster["models"][model_key]
-    effort = task.get("effort") or roster["effort"].get(tier)
     readonly = bool(task.get("readonly"))
     task_cwd = task.get("cwd") or cwd
 
+    # A named session is a persistent conversation with one model on one
+    # backend. Resuming pins the model - you cannot continue a conversation
+    # somewhere it never happened.
+    sess_name = task.get("session")
+    session, session_error, resumed = None, None, False
+    if sess_name:
+        with SESSIONS_LOCK:
+            existing = load_sessions().get(sess_name)
+        if existing:
+            if task.get("model") and task["model"] != existing["model"]:
+                session_error = (
+                    "session %r is pinned to %s (%s); refusing to resume it as %r. "
+                    "Use a different --session name, or `fleet sessions --forget %s`."
+                    % (sess_name, existing["model"], existing["backend"],
+                       task["model"], sess_name))
+            else:
+                model_key = existing["model"]
+                model = roster["models"][model_key]
+                tier = model["tier"]
+                session = dict(existing)
+                resumed = bool(session.get("native_id"))
+        else:
+            session = {"name": sess_name, "backend": model["backend"],
+                       "model": model_key, "cwd": task_cwd,
+                       "created": datetime.now(timezone.utc).isoformat(), "turns": 0}
+
+    effort = task.get("effort") or roster["effort"].get(tier)
+
     outfile = str(Path(run_dir) / ("%s.last.txt" % tid))
-    cmd, err = build_cmd(roster, model, task_cwd, effort, readonly, yolo, outfile)
+    cmd, err = (None, None) if session_error else build_cmd(
+        roster, model, task_cwd, effort, readonly, yolo, outfile, session=session)
 
     def shell(**over):
         """Every result carries the same keys, so callers never KeyError."""
@@ -229,9 +336,15 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
                 "backend": model["backend"], "tier": tier, "effort": effort,
                 "kind": task.get("kind"), "complexity": task.get("complexity"),
                 "readonly": readonly, "cwd": task_cwd, "seconds": 0.0,
-                "exit_code": None, "timed_out": False, "output": ""}
+                "exit_code": None, "timed_out": False, "output": "",
+                "session": sess_name, "resumed": resumed}
         base.update(over)
         return base
+
+    if session_error:
+        res = shell(exit_code=2, error=session_error, stderr=session_error)
+        Path(run_dir, "%s.json" % tid).write_text(json.dumps(res, indent=2))
+        return res
 
     if err:
         res = shell(exit_code=127, error=err, stderr=err)
@@ -241,7 +354,10 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
     prompt = task["prompt"]
     started = time.time()
     if verbose:
-        print("  -> [%s] %s (%s/%s)" % (tid, model_key, model["backend"], tier), file=sys.stderr)
+        print("  -> [%s] %s (%s/%s)%s" % (tid, model_key, model["backend"], tier,
+                                          "  resume:%s" % sess_name if resumed else
+                                          ("  new session:%s" % sess_name if sess_name else "")),
+              file=sys.stderr)
     try:
         proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
                               timeout=timeout, cwd=task_cwd)
@@ -275,6 +391,24 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
         result["meta"] = claude_meta(stdout)
     if rc != 0:
         result["stderr"] = stderr.strip()[-4000:]
+
+    result["session"] = sess_name
+    result["resumed"] = resumed
+    if session is not None:
+        native = session.get("native_id")
+        if model["backend"] == "claude":
+            native = (result.get("meta") or {}).get("session_id") or native
+        else:
+            native = parse_codex_thread_id(stdout) or native
+        if native and result["ok"]:
+            session["native_id"] = native
+            session["turns"] = session.get("turns", 0) + 1
+            session["last_used"] = datetime.now(timezone.utc).isoformat()
+            with SESSIONS_LOCK:
+                allsess = load_sessions()
+                allsess[sess_name] = session
+                save_sessions(allsess)
+        result["session_native_id"] = native
 
     Path(run_dir, "%s.json" % tid).write_text(json.dumps(result, indent=2))
     return result
@@ -421,6 +555,7 @@ def cmd_run(args):
         "readonly": args.readonly,
         "effort": args.effort,
         "cwd": cwd,
+        "session": args.session,
     }
     res = run_task(roster, task, run_dir, cwd, args.timeout, args.yolo, args.prefer,
                    verbose=not args.json)
@@ -428,7 +563,10 @@ def cmd_run(args):
     if args.json:
         print(json.dumps(res, indent=2))
     else:
-        print("\n--- %s via %s (%s, %ss) ---" % (res["id"], res["model"], res["backend"], res["seconds"]))
+        tag = ""
+        if res.get("session"):
+            tag = "  [session %s%s]" % (res["session"], ", resumed" if res.get("resumed") else ", new")
+        print("\n--- %s via %s (%s, %ss)%s ---" % (res["id"], res["model"], res["backend"], res["seconds"], tag))
         print(res["output"])
         if not res["ok"]:
             print("\n[FAILED rc=%s] %s" % (res["exit_code"], res.get("stderr", "")), file=sys.stderr)
@@ -481,6 +619,44 @@ def cmd_batch(args):
             print(r["output"] if r["ok"] else "[FAILED] %s" % r.get("stderr", ""))
     print("\nledger: %s" % run_dir, file=sys.stderr)
     return 0 if all(r["ok"] for r in results) else 1
+
+
+def cmd_sessions(args):
+    with SESSIONS_LOCK:
+        data = load_sessions()
+
+    if args.forget_all:
+        with SESSIONS_LOCK:
+            save_sessions({})
+        print("forgot %d session(s)" % len(data))
+        return 0
+
+    if args.forget:
+        if args.forget not in data:
+            die("no session named %r" % args.forget)
+        with SESSIONS_LOCK:
+            d = load_sessions()
+            d.pop(args.forget, None)
+            save_sessions(d)
+        print("forgot session %r" % args.forget)
+        return 0
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+
+    if not data:
+        print("no named sessions yet.\n"
+              "Start one:  fleet run \"...\" --session mywork --cwd /path/to/repo")
+        return 0
+
+    print("%-14s %-8s %-7s %-6s %-20s %s" % ("NAME", "MODEL", "BACKEND", "TURNS", "LAST USED", "CWD"))
+    for name, sess in sorted(data.items()):
+        print("%-14s %-8s %-7s %-6s %-20s %s" % (
+            name[:14], sess.get("model", "?"), sess.get("backend", "?"),
+            sess.get("turns", 0), (sess.get("last_used") or "-")[:19], sess.get("cwd", "?")))
+    print("\nResume:  fleet run \"next instruction\" --session <NAME>")
+    return 0
 
 
 def cmd_ledger(args):
@@ -541,6 +717,7 @@ def main():
     x.add_argument("--complexity", default="medium", choices=COMPLEXITIES)
     x.add_argument("--effort")
     x.add_argument("--readonly", action="store_true", help="no edits: review/research mode")
+    x.add_argument("--session", help="named persistent session: created on first use, resumed after")
     common(x)
     x.set_defaults(fn=cmd_run)
 
@@ -549,6 +726,12 @@ def main():
     b.add_argument("--max-parallel", type=int)
     common(b)
     b.set_defaults(fn=cmd_batch)
+
+    ss = sub.add_parser("sessions", help="list or forget named sessions")
+    ss.add_argument("--forget", metavar="NAME", help="drop one session")
+    ss.add_argument("--forget-all", action="store_true", help="drop every session")
+    ss.add_argument("--json", action="store_true")
+    ss.set_defaults(fn=cmd_sessions)
 
     l = sub.add_parser("ledger", help="list past runs")
     l.add_argument("--limit", type=int, default=15)

@@ -175,6 +175,7 @@ Three rules decide whether this works well:
 | `effort` | override reasoning effort |
 | `cwd` | per-task working directory |
 | `inherit_context` | set `false` to stop upstream output being injected |
+| `session` | named persistent session — see [Named sessions](#named-sessions) |
 
 ## CLI
 
@@ -185,10 +186,59 @@ Three rules decide whether this works well:
 | `fleet route [--all]` | ask the policy which model fits |
 | `fleet run <prompt>` | delegate one task |
 | `fleet batch <plan.json>` | dependency-ordered parallel fan-out |
+| `fleet sessions` | list named sessions; `--forget NAME` / `--forget-all` |
 | `fleet ledger [--show ID]` | past runs |
 
 Every run is recorded under `~/.fleet/runs/<timestamp>-<label>/` with the plan,
 each task's JSON result, and raw output.
+
+## Named sessions
+
+By default every delegation is a **fresh process with no memory** — that's what
+makes fan-out safe and parallel. But some work is a conversation: you want the
+same model to keep building on what it already did.
+
+A named session is a persistent conversation with one model on one backend:
+
+```bash
+fleet run "Read src/auth and summarise how sessions are issued." \
+  --session auth-work --kind research --complexity medium --readonly --cwd ~/code/myrepo
+```
+
+```bash
+fleet run "Now add refresh-token rotation to that flow." --session auth-work
+```
+
+The second call resumes the first. It needs no `--model`, `--kind` or `--cwd` —
+**a session pins its model, backend and working directory**, because a
+conversation can't be continued somewhere it never happened. Trying to resume
+one as a different model is refused with an explanation rather than silently
+starting over.
+
+Run two at once to keep a worker on each side, each with its own memory:
+
+```bash
+fleet sessions
+```
+
+```
+NAME           MODEL    BACKEND TURNS  LAST USED            CWD
+builder        sonnet   claude  4      2026-09-06T07:25:02  /Users/you/code/myrepo
+reviewer       sol      codex   3      2026-09-06T07:25:09  /Users/you/code/myrepo
+```
+
+That pairing is the useful one: a `builder` session that accumulates context
+about the change, and a `reviewer` session on the *other* family that has seen
+every previous round and can say "you reintroduced the bug from two rounds ago."
+
+Sessions work in plan files too, via `"session": "name"`. Note that two tasks
+sharing a session are serialised by that session's conversation — give them
+`deps` so the ordering is explicit rather than accidental.
+
+Under the hood: `claude --session-id/--resume` and `codex exec resume`. Session
+ids are recorded in `~/.fleet/sessions.json`; `fleet sessions --forget NAME`
+drops one. Forgetting a session doesn't delete the underlying conversation, it
+just stops fleet tracking it.
 
 ## Safety
 

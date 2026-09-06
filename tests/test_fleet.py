@@ -221,6 +221,111 @@ class MissingBackendIsGraceful(unittest.TestCase):
         self.assertIn("not installed", res["stderr"])
 
 
+class Sessions(unittest.TestCase):
+    """Named sessions keep continuity across separate CLI processes."""
+
+    def setUp(self):
+        self._orig = fleet.backend_bin
+        fleet.backend_bin = with_backends("claude", "codex")
+
+    def tearDown(self):
+        fleet.backend_bin = self._orig
+
+    def build(self, key, session, **kw):
+        opts = {"cwd": "/tmp/work", "effort": "medium", "readonly": False,
+                "yolo": False, "outfile": "/tmp/out.txt", "session": session}
+        opts.update(kw)
+        cmd, err = fleet.build_cmd(ROSTER, ROSTER["models"][key], **opts)
+        self.assertIsNone(err)
+        return cmd
+
+    def test_no_session_adds_no_session_flags(self):
+        cmd = self.build("sonnet", None)
+        self.assertNotIn("--session-id", cmd)
+        self.assertNotIn("--resume", cmd)
+        self.assertNotIn("resume", self.build("terra", None))
+
+    def test_claude_new_session_pins_a_uuid(self):
+        import uuid as _uuid
+        sess = {}
+        cmd = self.build("sonnet", sess)
+        self.assertIn("--session-id", cmd)
+        native = cmd[cmd.index("--session-id") + 1]
+        _uuid.UUID(native)  # must be a valid UUID or claude rejects it
+        self.assertEqual(sess["native_id"], native, "id must be recorded for later resume")
+
+    def test_claude_resume_uses_existing_id(self):
+        cmd = self.build("sonnet", {"native_id": "abc-123"})
+        self.assertIn("--resume", cmd)
+        self.assertEqual(cmd[cmd.index("--resume") + 1], "abc-123")
+        self.assertNotIn("--session-id", cmd)
+
+    def test_codex_resume_uses_resume_subcommand(self):
+        cmd = self.build("terra", {"native_id": "thread-9"})
+        self.assertEqual(cmd[1:4], ["exec", "resume", "thread-9"])
+
+    def test_codex_resume_avoids_unsupported_flags(self):
+        """`codex exec resume` rejects -s and -C, so they must not appear."""
+        cmd = self.build("terra", {"native_id": "thread-9"})
+        self.assertNotIn("-s", cmd)
+        self.assertNotIn("-C", cmd)
+
+    def test_codex_resume_preserves_sandbox_via_config(self):
+        ro = self.build("terra", {"native_id": "t"}, readonly=True)
+        self.assertIn('sandbox_mode="read-only"', ro)
+        rw = self.build("terra", {"native_id": "t"}, readonly=False)
+        self.assertIn('sandbox_mode="workspace-write"', rw)
+
+    def test_codex_resume_readonly_still_beats_yolo(self):
+        cmd = self.build("terra", {"native_id": "t"}, readonly=True, yolo=True)
+        self.assertIn('sandbox_mode="read-only"', cmd)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+
+    def test_thread_id_parsed_from_event_stream(self):
+        stream = "\n".join([
+            "not json",
+            json.dumps({"type": "thread.started", "thread_id": "01a0-abc"}),
+            json.dumps({"type": "turn.started"}),
+        ])
+        self.assertEqual(fleet.parse_codex_thread_id(stream), "01a0-abc")
+
+    def test_thread_id_absent_is_none(self):
+        self.assertIsNone(fleet.parse_codex_thread_id("garbage\n{}"))
+
+    def test_text_recovered_from_event_stream(self):
+        stream = "\n".join([
+            json.dumps({"type": "item.completed",
+                        "item": {"item_type": "assistant_message", "text": "first"}}),
+            json.dumps({"type": "item.completed",
+                        "item": {"item_type": "assistant_message", "text": "last"}}),
+        ])
+        self.assertEqual(fleet.codex_text_from_events(stream), "last")
+        self.assertEqual(fleet.extract_text("codex", stream, "/nonexistent"), "last")
+
+    def test_store_round_trips(self):
+        import tempfile
+        orig = fleet.FLEET_HOME
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                fleet.FLEET_HOME = Path(td)
+                self.assertEqual(fleet.load_sessions(), {})
+                fleet.save_sessions({"work": {"model": "sonnet", "native_id": "x", "turns": 1}})
+                self.assertEqual(fleet.load_sessions()["work"]["native_id"], "x")
+        finally:
+            fleet.FLEET_HOME = orig
+
+    def test_corrupt_store_does_not_crash(self):
+        import tempfile
+        orig = fleet.FLEET_HOME
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                fleet.FLEET_HOME = Path(td)
+                (Path(td) / "sessions.json").write_text("{not json")
+                self.assertEqual(fleet.load_sessions(), {})
+        finally:
+            fleet.FLEET_HOME = orig
+
+
 class OutputParsing(unittest.TestCase):
     def test_claude_json_result_is_extracted(self):
         blob = json.dumps({"result": "the answer", "total_cost_usd": 0.01})

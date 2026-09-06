@@ -129,6 +129,33 @@ Include what the previous attempt produced and why it was wrong. Two failures
 at the same tier means the task is under-specified, not that the model is too
 small — rewrite the prompt before spending a bigger model on it.
 
+## Named sessions (continuity)
+
+By default each delegation is a fresh process with no memory — good for fan-out,
+wrong for work that builds on itself. When you want the same model to keep
+context across several turns, give it a session name:
+
+```bash
+fleet run "Summarise how auth sessions are issued in src/auth." --session builder --kind research --complexity medium --readonly --cwd /abs/path
+fleet run "Now add refresh-token rotation to that flow." --session builder
+```
+
+The second call resumes the first and needs no `--model`/`--kind`/`--cwd`: a
+session pins its model, backend and working directory. In a plan file, use
+`"session": "name"`.
+
+The pattern worth reaching for is **one session per family**:
+
+- a `builder` session that accumulates context about the change, and
+- a `reviewer` session on the *other* backend that has seen every prior round,
+  so it can catch "you reintroduced the bug from two rounds ago."
+
+`fleet sessions` lists them; `fleet sessions --forget NAME` drops one.
+
+When *not* to use a session: independent parallel tasks. Two tasks sharing a
+session are serialised by that conversation, so give them explicit `deps` — and
+if they don't actually need shared memory, don't give them a session at all.
+
 ## Cross-family review
 
 The highest-value pattern here: **have the other family review the work.**
