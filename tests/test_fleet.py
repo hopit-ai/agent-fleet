@@ -144,6 +144,53 @@ class Waves(unittest.TestCase):
             fleet.plan_waves([{"id": "a", "deps": ["ghost"]}])
 
 
+class TaskIdValidation(unittest.TestCase):
+    def test_accepts_safe_ids(self):
+        fleet.validate_task_ids([
+            {"id": "survey"},
+            {"id": "review-2.final"},
+            {"id": "task_003"},
+        ])
+
+    def test_rejects_path_traversal_and_separators(self):
+        for tid in ("../escaped", "a/b", r"a\b", ".", "..", "/absolute"):
+            with self.subTest(tid=tid), self.assertRaises(ValueError):
+                fleet.validate_task_ids([{"id": tid}])
+
+    def test_rejects_duplicate_ids(self):
+        with self.assertRaisesRegex(ValueError, "duplicate task id"):
+            fleet.validate_task_ids([{"id": "same"}, {"id": "same"}])
+
+    def test_rejects_non_string_and_oversized_ids(self):
+        for tid in (None, 1, "x" * 129):
+            with self.subTest(tid=tid), self.assertRaises(ValueError):
+                fleet.validate_task_ids([{"id": tid}])
+
+    def test_artifact_path_stays_in_run_directory(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = fleet.task_artifact_path(td, "safe-id", ".json")
+            self.assertEqual(path.parent, Path(td).resolve())
+
+    def test_run_task_rejects_traversal_before_writing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            with self.assertRaises(ValueError):
+                fleet.run_task(
+                    ROSTER,
+                    {"id": "../escaped", "prompt": "hi", "model": "spark"},
+                    run_dir,
+                    td,
+                    10,
+                    False,
+                    "auto",
+                )
+            self.assertFalse((root / "escaped.json").exists())
+
+
 class CommandBuilding(unittest.TestCase):
     def setUp(self):
         self._orig = fleet.backend_bin

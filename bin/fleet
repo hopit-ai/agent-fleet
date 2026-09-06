@@ -12,6 +12,7 @@ import argparse
 import concurrent.futures as futures
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,7 @@ __version__ = "1.0.0"
 HERE = Path(__file__).resolve().parent
 FLEET_HOME = Path(os.environ.get("FLEET_HOME", Path.home() / ".fleet"))
 COMPLEXITIES = ["trivial", "low", "medium", "high", "extreme"]
+TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 SESSIONS_LOCK = threading.Lock()
 
@@ -115,6 +117,30 @@ def load_roster():
 def die(msg, code=2):
     print("fleet: %s" % msg, file=sys.stderr)
     sys.exit(code)
+
+
+def validate_task_ids(tasks):
+    """Reject task ids that are ambiguous or unsafe as artifact filenames."""
+    seen = set()
+    for task in tasks:
+        tid = task.get("id")
+        if not isinstance(tid, str) or not TASK_ID_RE.fullmatch(tid):
+            raise ValueError(
+                "invalid task id %r (use 1-128 letters, numbers, dots, underscores, or hyphens; "
+                "the first character must be a letter or number)" % tid
+            )
+        if tid in seen:
+            raise ValueError("duplicate task id %r" % tid)
+        seen.add(tid)
+
+
+def task_artifact_path(run_dir, task_id, suffix):
+    """Build a task artifact path and enforce containment as defense in depth."""
+    root = Path(run_dir).resolve()
+    candidate = (root / (task_id + suffix)).resolve()
+    if candidate.parent != root:
+        raise ValueError("task artifact path escapes run directory: %r" % task_id)
+    return candidate
 
 
 def backend_bin(roster, backend):
@@ -284,6 +310,7 @@ def claude_meta(stdout):
 def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
     """Execute one task dict. Returns a result dict."""
     tid = task.get("id") or uuid.uuid4().hex[:8]
+    validate_task_ids([dict(task, id=tid)])
     model_key = task.get("model")
     tier = None
     if model_key:
@@ -326,7 +353,7 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
 
     effort = task.get("effort") or roster["effort"].get(tier)
 
-    outfile = str(Path(run_dir) / ("%s.last.txt" % tid))
+    outfile = str(task_artifact_path(run_dir, tid, ".last.txt"))
     cmd, err = (None, None) if session_error else build_cmd(
         roster, model, task_cwd, effort, readonly, yolo, outfile, session=session)
 
@@ -343,12 +370,12 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
 
     if session_error:
         res = shell(exit_code=2, error=session_error, stderr=session_error)
-        Path(run_dir, "%s.json" % tid).write_text(json.dumps(res, indent=2))
+        task_artifact_path(run_dir, tid, ".json").write_text(json.dumps(res, indent=2))
         return res
 
     if err:
         res = shell(exit_code=127, error=err, stderr=err)
-        Path(run_dir, "%s.json" % tid).write_text(json.dumps(res, indent=2))
+        task_artifact_path(run_dir, tid, ".json").write_text(json.dumps(res, indent=2))
         return res
 
     prompt = task["prompt"]
@@ -410,7 +437,7 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
                 save_sessions(allsess)
         result["session_native_id"] = native
 
-    Path(run_dir, "%s.json" % tid).write_text(json.dumps(result, indent=2))
+    task_artifact_path(run_dir, tid, ".json").write_text(json.dumps(result, indent=2))
     return result
 
 
@@ -545,7 +572,6 @@ def read_prompt(args):
 def cmd_run(args):
     roster = load_roster()
     cwd = str(Path(args.cwd or os.getcwd()).resolve())
-    run_dir = new_run_dir("run")
     task = {
         "id": args.id or "t1",
         "prompt": read_prompt(args),
@@ -557,6 +583,11 @@ def cmd_run(args):
         "cwd": cwd,
         "session": args.session,
     }
+    try:
+        validate_task_ids([task])
+    except ValueError as e:
+        die(str(e))
+    run_dir = new_run_dir("run")
     res = run_task(roster, task, run_dir, cwd, args.timeout, args.yolo, args.prefer,
                    verbose=not args.json)
     (run_dir / "run.json").write_text(json.dumps({"cwd": cwd, "results": [res]}, indent=2))
@@ -581,6 +612,10 @@ def cmd_batch(args):
     tasks = plan["tasks"]
     for i, t in enumerate(tasks):
         t.setdefault("id", "t%d" % (i + 1))
+    try:
+        validate_task_ids(tasks)
+    except ValueError as e:
+        die(str(e))
     run_dir = new_run_dir(plan.get("label", "batch"))
     Path(run_dir, "plan.json").write_text(json.dumps(plan, indent=2))
 
