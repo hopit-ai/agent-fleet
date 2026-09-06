@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""fleet - route coding tasks across Claude Code and Codex models.
+
+The orchestrator (Fable in Claude Code, Astra in Codex) plans and reviews.
+This tool does the dispatching: it picks a model for a task and shells out to
+`claude -p` or `codex exec` to do the work, then hands back a JSON result.
+
+Stdlib only. No network of its own.
+"""
+
+import argparse
+import concurrent.futures as futures
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+HERE = Path(__file__).resolve().parent
+FLEET_HOME = Path(os.environ.get("FLEET_HOME", Path.home() / ".fleet"))
+COMPLEXITIES = ["trivial", "low", "medium", "high", "extreme"]
+
+AUTH_FIX = {
+    "claude": "run `claude` interactively once, or `claude auth login`",
+    "codex":  "open the Codex/ChatGPT app and sign in, or `codex login`",
+}
+
+
+# ---------------------------------------------------------------- roster ----
+
+def load_roster():
+    candidates = []
+    if os.environ.get("FLEET_ROSTER"):
+        candidates.append(Path(os.environ["FLEET_ROSTER"]))
+    candidates += [
+        Path.cwd() / ".fleet" / "roster.json",
+        FLEET_HOME / "roster.json",
+        HERE.parent / "roster.json",
+    ]
+    for c in candidates:
+        if c.is_file():
+            with open(c) as fh:
+                r = json.load(fh)
+            r["_source"] = str(c)
+            return r
+    die("no roster.json found (looked in %s)" % ", ".join(str(c) for c in candidates))
+
+
+def die(msg, code=2):
+    print("fleet: %s" % msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def backend_bin(roster, backend):
+    """Resolve a backend's executable, or None if not installed."""
+    spec = roster["backends"].get(backend)
+    if not spec:
+        return None
+    env_override = os.environ.get("FLEET_%s_BIN" % backend.upper())
+    for cand in ([env_override] if env_override else []) + [spec["bin"]] + spec.get("bin_fallbacks", []):
+        if not cand:
+            continue
+        cand = os.path.expanduser(os.path.expandvars(cand))
+        if os.path.sep in cand:
+            found = cand if os.access(cand, os.X_OK) else None
+        else:
+            found = shutil.which(cand)
+        if found:
+            return found
+    return None
+
+
+def available_backends(roster):
+    return {b: backend_bin(roster, b) for b in roster["backends"] if backend_bin(roster, b)}
+
+
+# --------------------------------------------------------------- routing ----
+
+def route(roster, kind, complexity, prefer="auto", avoid_backend=None):
+    """Deterministic policy: (kind, complexity) -> tier -> concrete model."""
+    table = roster["routing"]
+    if kind not in table:
+        kind = "implement"
+    if complexity not in COMPLEXITIES:
+        complexity = "medium"
+    tier = table[kind][complexity]
+
+    avail = available_backends(roster)
+    # With nothing installed we still answer policy questions (`fleet route`),
+    # so the matrix can be inspected before committing to an install. Actually
+    # dispatching still fails loudly, in build_cmd().
+    policy_only = not avail
+
+    order = []
+    if prefer and prefer != "auto":
+        order.append(prefer)
+    # Balance: default the non-preferred choice by what's installed.
+    order += [b for b in ("claude", "codex") if b not in order]
+    if avoid_backend:
+        order = [b for b in order if b != avoid_backend] + [b for b in order if b == avoid_backend]
+
+    def usable(backend):
+        return policy_only or backend in avail
+
+    defaults = roster["tier_defaults"][tier]
+    for backend in order:
+        if usable(backend) and defaults.get(backend):
+            return defaults[backend], tier
+    # Tier unavailable on any installed backend - fall back down the tiers.
+    tiers = roster["tier_order"]
+    idx = tiers.index(tier)
+    for t in tiers[idx::-1] + tiers[idx:]:
+        for backend in order:
+            if usable(backend) and roster["tier_defaults"][t].get(backend):
+                return roster["tier_defaults"][t][backend], t
+    die("no model available for tier %s" % tier)
+
+
+def resolve_model(roster, key):
+    models = roster["models"]
+    if key in models:
+        return key, models[key]
+    # Allow raw ids too (e.g. "gpt-5.6-sol").
+    for k, m in models.items():
+        if m["id"] == key:
+            return k, m
+    die("unknown model %r (known: %s)" % (key, ", ".join(sorted(models))))
+
+
+# ------------------------------------------------------------- execution ----
+
+def build_cmd(roster, model, cwd, effort, readonly, yolo, outfile):
+    backend = model["backend"]
+    exe = backend_bin(roster, backend)
+    if not exe:
+        return None, "backend %s is not installed - run `fleet doctor` to see what resolves" % backend
+
+    if backend == "claude":
+        cmd = [exe, "-p", "--model", model["id"], "--output-format", "json"]
+        if effort:
+            cmd += ["--effort", effort]
+        if readonly:
+            cmd += ["--permission-mode", "dontAsk",
+                    "--disallowed-tools", "Edit", "Write", "NotebookEdit"]
+        elif yolo:
+            cmd += ["--dangerously-skip-permissions"]
+        else:
+            cmd += ["--permission-mode", "acceptEdits"]
+        cmd += ["--add-dir", cwd]
+        return cmd, None
+
+    if backend == "codex":
+        cmd = [exe, "exec", "-", "-m", model["id"], "-C", cwd,
+               "--skip-git-repo-check", "-o", outfile]
+        if effort:
+            cmd += ["-c", "model_reasoning_effort=%s" % effort]
+        if readonly:
+            cmd += ["-s", "read-only"]
+        elif yolo:
+            cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            cmd += ["-s", "workspace-write"]
+        return cmd, None
+
+    return None, "unknown backend %s" % backend
+
+
+def extract_text(backend, stdout, outfile):
+    if backend == "codex":
+        try:
+            txt = Path(outfile).read_text().strip()
+            if txt:
+                return txt
+        except OSError:
+            pass
+        return stdout.strip()[-8000:]
+    # claude --output-format json
+    try:
+        obj = json.loads(stdout)
+        if isinstance(obj, dict):
+            return obj.get("result") or json.dumps(obj)[:8000]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return stdout.strip()[-8000:]
+
+
+def claude_meta(stdout):
+    try:
+        obj = json.loads(stdout)
+        if isinstance(obj, dict):
+            return {k: obj[k] for k in ("total_cost_usd", "num_turns", "duration_ms", "session_id", "is_error")
+                    if k in obj}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {}
+
+
+def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
+    """Execute one task dict. Returns a result dict."""
+    tid = task.get("id") or uuid.uuid4().hex[:8]
+    model_key = task.get("model")
+    tier = None
+    if model_key:
+        model_key, _ = resolve_model(roster, model_key)
+        tier = roster["models"][model_key]["tier"]
+    else:
+        model_key, tier = route(roster, task.get("kind", "implement"),
+                                task.get("complexity", "medium"),
+                                prefer=task.get("prefer", prefer),
+                                avoid_backend=task.get("avoid_backend"))
+    model = roster["models"][model_key]
+    effort = task.get("effort") or roster["effort"].get(tier)
+    readonly = bool(task.get("readonly"))
+    task_cwd = task.get("cwd") or cwd
+
+    outfile = str(Path(run_dir) / ("%s.last.txt" % tid))
+    cmd, err = build_cmd(roster, model, task_cwd, effort, readonly, yolo, outfile)
+
+    def shell(**over):
+        """Every result carries the same keys, so callers never KeyError."""
+        base = {"id": tid, "ok": False, "model": model_key, "model_id": model["id"],
+                "backend": model["backend"], "tier": tier, "effort": effort,
+                "kind": task.get("kind"), "complexity": task.get("complexity"),
+                "readonly": readonly, "cwd": task_cwd, "seconds": 0.0,
+                "exit_code": None, "timed_out": False, "output": ""}
+        base.update(over)
+        return base
+
+    if err:
+        res = shell(exit_code=127, error=err, stderr=err)
+        Path(run_dir, "%s.json" % tid).write_text(json.dumps(res, indent=2))
+        return res
+
+    prompt = task["prompt"]
+    started = time.time()
+    if verbose:
+        print("  -> [%s] %s (%s/%s)" % (tid, model_key, model["backend"], tier), file=sys.stderr)
+    try:
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                              timeout=timeout, cwd=task_cwd)
+        stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        stdout, stderr, rc, timed_out = "", "timed out after %ss" % timeout, 124, True
+    except OSError as e:
+        stdout, stderr, rc, timed_out = "", str(e), 127, False
+
+    elapsed = round(time.time() - started, 1)
+    text = extract_text(model["backend"], stdout, outfile)
+    result = {
+        "id": tid,
+        "ok": rc == 0 and not timed_out,
+        "model": model_key,
+        "model_id": model["id"],
+        "backend": model["backend"],
+        "tier": tier,
+        "effort": effort,
+        "kind": task.get("kind"),
+        "complexity": task.get("complexity"),
+        "readonly": readonly,
+        "cwd": task_cwd,
+        "seconds": elapsed,
+        "exit_code": rc,
+        "timed_out": timed_out,
+        "output": text,
+    }
+    if model["backend"] == "claude":
+        result["meta"] = claude_meta(stdout)
+    if rc != 0:
+        result["stderr"] = stderr.strip()[-4000:]
+
+    Path(run_dir, "%s.json" % tid).write_text(json.dumps(result, indent=2))
+    return result
+
+
+# ----------------------------------------------------------------- ledger ----
+
+def new_run_dir(label="run"):
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    d = FLEET_HOME / "runs" / ("%s-%s-%s" % (stamp, label, uuid.uuid4().hex[:6]))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# ------------------------------------------------------------------ waves ----
+
+def plan_waves(tasks):
+    """Topologically group tasks into dependency waves."""
+    by_id = {t["id"]: t for t in tasks}
+    done, waves, remaining = set(), [], list(tasks)
+    while remaining:
+        wave = [t for t in remaining if all(d in done for d in t.get("deps", []))]
+        if not wave:
+            unmet = {t["id"]: [d for d in t.get("deps", []) if d not in done and d not in by_id]
+                     for t in remaining}
+            die("dependency cycle or unknown deps: %s" % json.dumps(unmet))
+        waves.append(wave)
+        done |= {t["id"] for t in wave}
+        remaining = [t for t in remaining if t["id"] not in done]
+    return waves
+
+
+# --------------------------------------------------------------- commands ----
+
+def cmd_doctor(args):
+    roster = load_roster()
+    print("roster:      %s" % roster["_source"])
+    print("fleet home:  %s" % FLEET_HOME)
+    ok = False
+    for b in roster["backends"]:
+        path = backend_bin(roster, b)
+        if path:
+            try:
+                ver = subprocess.run([path] + roster["backends"][b].get("probe", ["--version"]),
+                                     capture_output=True, text=True, timeout=30).stdout.strip()
+            except Exception as e:
+                ver = "(probe failed: %s)" % e
+            print("  [ok]      %-7s %s  -- %s" % (b, path, ver.splitlines()[0] if ver else "?"))
+            ok = True
+        else:
+            print("  [missing] %-7s not on PATH" % b)
+    if not ok:
+        print("\nNo backends found. Install Claude Code and/or the Codex CLI.")
+        return 1
+    print("\nModels reachable:")
+    avail = available_backends(roster)
+    for k, m in roster["models"].items():
+        mark = "ok " if m["backend"] in avail else "-- "
+        print("  %s %-8s %-7s %-9s %s" % (mark, k, m["backend"], m["tier"], m["id"]))
+
+    if getattr(args, "auth", False):
+        print("\nLive auth probe (one trivial prompt per backend):")
+        healthy = True
+        with tempfile.TemporaryDirectory() as td:
+            for b in avail:
+                key = roster["tier_defaults"]["light"].get(b)
+                if not key:
+                    continue
+                task = {"id": "probe-%s" % b, "prompt": "Reply with exactly: PONG",
+                        "model": key, "readonly": True}
+                r = run_task(roster, task, td, td, 120, False, "auto")
+                blob = (r.get("output", "") + " " + r.get("stderr", "")).lower()
+                if r["ok"] and "pong" in r.get("output", "").upper().lower():
+                    print("  [ok]      %-7s %s responded (%ss)" % (b, key, r["seconds"]))
+                elif "oauth" in blob or "401" in blob or "authenticate" in blob:
+                    healthy = False
+                    print("  [AUTH]    %-7s token expired. Fix: %s" % (b, AUTH_FIX.get(b, "re-login")))
+                else:
+                    healthy = False
+                    print("  [FAIL]    %-7s %s" % (b, (r.get("output") or r.get("stderr") or "no output").strip()[:160]))
+        if not healthy:
+            print("\nDelegation to a failing backend will error at run time.")
+            return 1
+    return 0
+
+
+def cmd_models(args):
+    roster = load_roster()
+    avail = available_backends(roster)
+    if args.json:
+        print(json.dumps({k: dict(v, available=v["backend"] in avail)
+                          for k, v in roster["models"].items()}, indent=2))
+        return 0
+    for tier in reversed(roster["tier_order"]):
+        print("\n%s" % tier.upper())
+        for k, m in roster["models"].items():
+            if m["tier"] == tier:
+                print("  %-8s %-7s %-30s %s%s" % (
+                    k, m["backend"], m["id"], m.get("blurb", ""),
+                    "" if m["backend"] in avail else "   [backend not installed]"))
+    return 0
+
+
+def cmd_route(args):
+    roster = load_roster()
+    if args.all:
+        print("%-12s %s" % ("kind", "  ".join("%-10s" % c for c in COMPLEXITIES)))
+        for kind in roster["routing"]:
+            if kind.startswith("_"):
+                continue
+            cells = []
+            for c in COMPLEXITIES:
+                mk, _ = route(roster, kind, c, prefer=args.prefer)
+                cells.append("%-10s" % mk)
+            print("%-12s %s" % (kind, "  ".join(cells)))
+        return 0
+    model_key, tier = route(roster, args.kind, args.complexity, prefer=args.prefer)
+    m = roster["models"][model_key]
+    out = {"model": model_key, "tier": tier, "backend": m["backend"], "model_id": m["id"],
+           "effort": roster["effort"].get(tier)}
+    print(json.dumps(out, indent=2) if args.json else
+          "%s  (%s, tier=%s, effort=%s)" % (model_key, m["backend"], tier, out["effort"]))
+    return 0
+
+
+def read_prompt(args):
+    if args.prompt_file:
+        return Path(args.prompt_file).read_text()
+    if args.prompt and args.prompt != "-":
+        return args.prompt
+    return sys.stdin.read()
+
+
+def cmd_run(args):
+    roster = load_roster()
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    run_dir = new_run_dir("run")
+    task = {
+        "id": args.id or "t1",
+        "prompt": read_prompt(args),
+        "kind": args.kind,
+        "complexity": args.complexity,
+        "model": args.model,
+        "readonly": args.readonly,
+        "effort": args.effort,
+        "cwd": cwd,
+    }
+    res = run_task(roster, task, run_dir, cwd, args.timeout, args.yolo, args.prefer,
+                   verbose=not args.json)
+    (run_dir / "run.json").write_text(json.dumps({"cwd": cwd, "results": [res]}, indent=2))
+    if args.json:
+        print(json.dumps(res, indent=2))
+    else:
+        print("\n--- %s via %s (%s, %ss) ---" % (res["id"], res["model"], res["backend"], res["seconds"]))
+        print(res["output"])
+        if not res["ok"]:
+            print("\n[FAILED rc=%s] %s" % (res["exit_code"], res.get("stderr", "")), file=sys.stderr)
+    print("\nledger: %s" % run_dir, file=sys.stderr)
+    return 0 if res["ok"] else 1
+
+
+def cmd_batch(args):
+    roster = load_roster()
+    plan = json.load(open(args.plan)) if args.plan != "-" else json.load(sys.stdin)
+    cwd = str(Path(plan.get("cwd") or args.cwd or os.getcwd()).resolve())
+    tasks = plan["tasks"]
+    for i, t in enumerate(tasks):
+        t.setdefault("id", "t%d" % (i + 1))
+    run_dir = new_run_dir(plan.get("label", "batch"))
+    Path(run_dir, "plan.json").write_text(json.dumps(plan, indent=2))
+
+    maxpar = args.max_parallel or roster["defaults"]["max_parallel"]
+    waves = plan_waves(tasks)
+    print("fleet: %d task(s) in %d wave(s), up to %d in parallel"
+          % (len(tasks), len(waves), maxpar), file=sys.stderr)
+
+    results, prior = [], {}
+    for wi, wave in enumerate(waves, 1):
+        print("\nwave %d/%d (%d task(s))" % (wi, len(waves), len(wave)), file=sys.stderr)
+        for t in wave:
+            if t.get("deps") and t.get("inherit_context", True):
+                ctx = "\n\n".join(
+                    "## Result of upstream task %s (%s)\n%s" % (d, prior[d]["model"], prior[d]["output"])
+                    for d in t["deps"] if d in prior)
+                if ctx:
+                    t["prompt"] = t["prompt"] + "\n\n---\n# Context from completed upstream tasks\n" + ctx
+        with futures.ThreadPoolExecutor(max_workers=maxpar) as ex:
+            futs = {ex.submit(run_task, roster, t, run_dir, cwd, args.timeout,
+                              args.yolo, args.prefer, True): t for t in wave}
+            for f in futures.as_completed(futs):
+                r = f.result()
+                prior[r["id"]] = r
+                results.append(r)
+                print("  %s [%s] %s in %ss" % ("ok  " if r["ok"] else "FAIL",
+                                               r["model"], r["id"], r["seconds"]), file=sys.stderr)
+
+    summary = {"cwd": cwd, "goal": plan.get("goal"), "run_dir": str(run_dir), "results": results}
+    Path(run_dir, "run.json").write_text(json.dumps(summary, indent=2))
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        for r in results:
+            print("\n===== %s | %s (%s, tier=%s, %ss) =====" % (r["id"], r["model"], r["backend"], r["tier"], r["seconds"]))
+            print(r["output"] if r["ok"] else "[FAILED] %s" % r.get("stderr", ""))
+    print("\nledger: %s" % run_dir, file=sys.stderr)
+    return 0 if all(r["ok"] for r in results) else 1
+
+
+def cmd_ledger(args):
+    runs = sorted((FLEET_HOME / "runs").glob("*")) if (FLEET_HOME / "runs").is_dir() else []
+    if args.show:
+        target = next((r for r in runs if args.show in r.name), None)
+        if not target:
+            die("no run matching %r" % args.show)
+        print(Path(target, "run.json").read_text())
+        return 0
+    for r in runs[-(args.limit):]:
+        try:
+            data = json.loads(Path(r, "run.json").read_text())
+            n = len(data.get("results", []))
+            bad = sum(1 for x in data.get("results", []) if not x["ok"])
+            models = ",".join(sorted({x["model"] for x in data.get("results", [])}))
+            print("%-46s %2d task(s) %s  [%s]" % (r.name, n, "%d failed" % bad if bad else "all ok", models))
+        except (OSError, json.JSONDecodeError):
+            print("%-46s (incomplete)" % r.name)
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="fleet", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-V", "--version", action="version", version="fleet %s" % __version__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    d = sub.add_parser("doctor", help="show which backends and models are reachable")
+    d.add_argument("--auth", action="store_true", help="also send one trivial prompt per backend to verify credentials")
+    d.set_defaults(fn=cmd_doctor)
+
+    m = sub.add_parser("models", help="list the roster")
+    m.add_argument("--json", action="store_true")
+    m.set_defaults(fn=cmd_models)
+
+    r = sub.add_parser("route", help="ask the policy which model fits a task")
+    r.add_argument("--kind", default="implement")
+    r.add_argument("--complexity", default="medium", choices=COMPLEXITIES)
+    r.add_argument("--prefer", default="auto", choices=["auto", "claude", "codex"])
+    r.add_argument("--all", action="store_true", help="print the whole routing matrix")
+    r.add_argument("--json", action="store_true")
+    r.set_defaults(fn=cmd_route)
+
+    def common(sp):
+        sp.add_argument("--cwd")
+        sp.add_argument("--timeout", type=int, default=1800)
+        sp.add_argument("--prefer", default="auto", choices=["auto", "claude", "codex"])
+        sp.add_argument("--yolo", action="store_true", help="skip sandbox/permission checks")
+        sp.add_argument("--json", action="store_true")
+
+    x = sub.add_parser("run", help="delegate a single task")
+    x.add_argument("prompt", nargs="?", help="prompt text, or - for stdin")
+    x.add_argument("--prompt-file")
+    x.add_argument("--id")
+    x.add_argument("--model", help="force a model (bypasses routing)")
+    x.add_argument("--kind", default="implement")
+    x.add_argument("--complexity", default="medium", choices=COMPLEXITIES)
+    x.add_argument("--effort")
+    x.add_argument("--readonly", action="store_true", help="no edits: review/research mode")
+    common(x)
+    x.set_defaults(fn=cmd_run)
+
+    b = sub.add_parser("batch", help="run a plan.json of tasks with deps, in parallel waves")
+    b.add_argument("plan", help="path to plan JSON, or - for stdin")
+    b.add_argument("--max-parallel", type=int)
+    common(b)
+    b.set_defaults(fn=cmd_batch)
+
+    l = sub.add_parser("ledger", help="list past runs")
+    l.add_argument("--limit", type=int, default=15)
+    l.add_argument("--show", help="print run.json for a run whose name contains this")
+    l.set_defaults(fn=cmd_ledger)
+
+    args = p.parse_args()
+    sys.exit(args.fn(args))
+
+
+if __name__ == "__main__":
+    main()

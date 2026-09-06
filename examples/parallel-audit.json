@@ -1,0 +1,19 @@
+{
+  "goal": "Audit a repo along independent dimensions at once, then synthesise",
+  "label": "audit",
+  "cwd": "/absolute/path/to/your/repo",
+  "tasks": [
+    {"id": "sec",   "kind": "review", "complexity": "high", "readonly": true,
+     "prompt": "Audit this repo for security issues: injection, authz gaps, secrets in source, unsafe deserialisation. file:line findings only."},
+
+    {"id": "perf",  "kind": "review", "complexity": "medium", "readonly": true,
+     "prompt": "Audit this repo for performance problems: N+1 queries, unbounded loads, sync I/O on hot paths. file:line findings only."},
+
+    {"id": "tests", "kind": "review", "complexity": "medium", "readonly": true,
+     "prompt": "Identify the highest-risk untested code paths in this repo. Rank by blast radius. file:line only."},
+
+    {"id": "report", "kind": "docs", "complexity": "medium", "deps": ["sec", "perf", "tests"],
+     "readonly": true,
+     "prompt": "Using only the three audit results above, write a single prioritised markdown report. Group by severity, drop duplicates, and note where two audits flag the same root cause. Do not re-read the repo."}
+  ]
+}

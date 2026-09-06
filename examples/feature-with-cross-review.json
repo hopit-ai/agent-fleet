@@ -1,0 +1,30 @@
+{
+  "goal": "Add rate limiting to the public API, reviewed by the other model family",
+  "label": "ratelimit",
+  "cwd": "/absolute/path/to/your/repo",
+  "tasks": [
+    {
+      "id": "survey",
+      "kind": "research",
+      "complexity": "medium",
+      "readonly": true,
+      "prompt": "List every route registered under /api/public. For each: file:line, HTTP method, and any middleware already applied. Output a markdown table. Do not modify anything."
+    },
+    {
+      "id": "impl",
+      "kind": "implement",
+      "complexity": "high",
+      "deps": ["survey"],
+      "prompt": "Implement token-bucket rate limiting as middleware and apply it to every route in the table above. Match the existing middleware style in this repo. Add unit tests covering the refill boundary."
+    },
+    {
+      "id": "xreview",
+      "kind": "review",
+      "complexity": "high",
+      "deps": ["impl"],
+      "avoid_backend": "claude",
+      "readonly": true,
+      "prompt": "Adversarially review the change described above. Assume it contains at least one real bug. Check: wall-clock vs monotonic time, refill arithmetic and capacity overflow, lock coverage of read-modify-write, and unvalidated inputs. Report findings as a numbered list, each with file:line and a concrete failure scenario. If something is correct, say so rather than inventing a finding. Do not edit any file."
+    }
+  ]
+}

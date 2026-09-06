@@ -1,0 +1,200 @@
+{
+  "_comment": "Fleet roster. Edit tiers/routing to change delegation policy. Model ids are provider-specific; run `fleet doctor` to see what resolves on this machine.",
+  "backends": {
+    "claude": {
+      "bin": "claude",
+      "probe": [
+        "--version"
+      ]
+    },
+    "codex": {
+      "bin": "codex",
+      "bin_fallbacks": [
+        "/Applications/ChatGPT.app/Contents/Resources/codex",
+        "/Applications/Codex.app/Contents/Resources/codex",
+        "~/.codex/bin/codex",
+        "/usr/local/bin/codex",
+        "/opt/homebrew/bin/codex"
+      ],
+      "probe": [
+        "--version"
+      ]
+    }
+  },
+  "models": {
+    "fable": {
+      "backend": "claude",
+      "id": "fable",
+      "tier": "orchestrator",
+      "blurb": "Claude Fable 5.1 - planning, review, synthesis"
+    },
+    "astra": {
+      "backend": "codex",
+      "id": "gpt-6-astra",
+      "tier": "orchestrator",
+      "blurb": "GPT-6-Astra - planning, review, hardest problems"
+    },
+    "opus": {
+      "backend": "claude",
+      "id": "opus",
+      "tier": "heavy",
+      "blurb": "Claude Opus 5 - deep implementation, tricky debugging"
+    },
+    "sol": {
+      "backend": "codex",
+      "id": "gpt-5.6-sol",
+      "tier": "heavy",
+      "blurb": "GPT-5.6-Sol - deep implementation, algorithms"
+    },
+    "sonnet": {
+      "backend": "claude",
+      "id": "sonnet",
+      "tier": "mid",
+      "blurb": "Claude Sonnet 5 - everyday feature work"
+    },
+    "terra": {
+      "backend": "codex",
+      "id": "gpt-5.6-terra",
+      "tier": "mid",
+      "blurb": "GPT-5.6-Terra - everyday feature work"
+    },
+    "luna": {
+      "backend": "codex",
+      "id": "gpt-5.6-luna",
+      "tier": "mid",
+      "blurb": "GPT-5.6-Luna - everyday feature work"
+    },
+    "gpt55": {
+      "backend": "codex",
+      "id": "gpt-5.5",
+      "tier": "mid",
+      "blurb": "GPT-5.5 - general purpose"
+    },
+    "haiku": {
+      "backend": "claude",
+      "id": "claude-haiku-4-5-20251001",
+      "tier": "light",
+      "blurb": "Claude Haiku 4.5 - fast mechanical edits"
+    },
+    "mini": {
+      "backend": "codex",
+      "id": "gpt-5.4-mini",
+      "tier": "light",
+      "blurb": "GPT-5.4-Mini - fast mechanical edits"
+    },
+    "spark": {
+      "backend": "codex",
+      "id": "gpt-5.3-codex-spark",
+      "tier": "light",
+      "blurb": "GPT-5.3-Codex-Spark - fastest, narrow edits"
+    }
+  },
+  "tier_order": [
+    "light",
+    "mid",
+    "heavy",
+    "orchestrator"
+  ],
+  "tier_defaults": {
+    "orchestrator": {
+      "claude": "fable",
+      "codex": "astra"
+    },
+    "heavy": {
+      "claude": "opus",
+      "codex": "sol"
+    },
+    "mid": {
+      "claude": "sonnet",
+      "codex": "terra"
+    },
+    "light": {
+      "claude": "haiku",
+      "codex": "spark"
+    }
+  },
+  "routing": {
+    "_comment": "kind -> complexity -> tier. Complexity: trivial|low|medium|high|extreme.",
+    "boilerplate": {
+      "trivial": "light",
+      "low": "light",
+      "medium": "light",
+      "high": "mid",
+      "extreme": "mid"
+    },
+    "docs": {
+      "trivial": "light",
+      "low": "light",
+      "medium": "mid",
+      "high": "mid",
+      "extreme": "heavy"
+    },
+    "test": {
+      "trivial": "light",
+      "low": "light",
+      "medium": "mid",
+      "high": "mid",
+      "extreme": "heavy"
+    },
+    "refactor": {
+      "trivial": "light",
+      "low": "mid",
+      "medium": "mid",
+      "high": "heavy",
+      "extreme": "heavy"
+    },
+    "implement": {
+      "trivial": "light",
+      "low": "mid",
+      "medium": "mid",
+      "high": "heavy",
+      "extreme": "heavy"
+    },
+    "triage": {
+      "trivial": "light",
+      "low": "light",
+      "medium": "mid",
+      "high": "mid",
+      "extreme": "heavy"
+    },
+    "research": {
+      "trivial": "light",
+      "low": "mid",
+      "medium": "mid",
+      "high": "heavy",
+      "extreme": "heavy"
+    },
+    "debug": {
+      "trivial": "light",
+      "low": "mid",
+      "medium": "heavy",
+      "high": "heavy",
+      "extreme": "orchestrator"
+    },
+    "review": {
+      "trivial": "light",
+      "low": "mid",
+      "medium": "mid",
+      "high": "heavy",
+      "extreme": "heavy"
+    },
+    "plan": {
+      "trivial": "mid",
+      "low": "mid",
+      "medium": "heavy",
+      "high": "orchestrator",
+      "extreme": "orchestrator"
+    }
+  },
+  "effort": {
+    "light": "low",
+    "mid": "medium",
+    "heavy": "high",
+    "orchestrator": "high"
+  },
+  "defaults": {
+    "prefer_backend": "auto",
+    "timeout_seconds": 1800,
+    "max_parallel": 4
+  }
+}
