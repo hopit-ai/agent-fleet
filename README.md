@@ -47,7 +47,7 @@ useful. Neither was authoritative. **Read the diff.**
 - Python 3.9+ (standard library only — no pip install)
 - At least one of:
   - [Claude Code](https://claude.com/claude-code) (`claude` on your PATH)
-  - [Codex CLI] (https://openai.com/codex/) (`codex` on your PATH; on macOS it also ships inside the ChatGPT
+  - [Codex CLI](https://openai.com/codex/) (`codex` on your PATH; on macOS it also ships inside the ChatGPT
     app and `fleet` finds it there automatically)
 
 Having both is the point, but it degrades gracefully to one.
