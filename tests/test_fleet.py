@@ -172,23 +172,95 @@ class TaskIdValidation(unittest.TestCase):
             path = fleet.task_artifact_path(td, "safe-id", ".json")
             self.assertEqual(path.parent, Path(td).resolve())
 
-    def test_run_task_rejects_traversal_before_writing(self):
+    def test_run_task_rejects_traversal_without_writing_or_raising(self):
+        """A bad id yields the usual failed-result shape, never a traceback."""
         import tempfile
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             run_dir = root / "run"
             run_dir.mkdir()
-            with self.assertRaises(ValueError):
-                fleet.run_task(
-                    ROSTER,
-                    {"id": "../escaped", "prompt": "hi", "model": "spark"},
-                    run_dir,
-                    td,
-                    10,
-                    False,
-                    "auto",
-                )
+            res = fleet.run_task(
+                ROSTER,
+                {"id": "../escaped", "prompt": "hi", "model": "spark"},
+                run_dir, td, 10, False, "auto",
+            )
+            self.assertFalse(res["ok"])
+            self.assertIn("invalid task id", res["stderr"])
+            for key in ("id", "ok", "model", "backend", "tier", "seconds", "output"):
+                self.assertIn(key, res, "missing %r - callers will KeyError" % key)
             self.assertFalse((root / "escaped.json").exists())
+            self.assertEqual(list(run_dir.iterdir()), [], "no artifact for an untrusted id")
+
+    def test_rejects_ids_differing_only_in_case(self):
+        """Case-insensitive filesystems collapse these to one artifact file."""
+        with self.assertRaisesRegex(ValueError, "duplicate task id"):
+            fleet.validate_task_ids([{"id": "Survey"}, {"id": "survey"}])
+
+
+class RunDirectoryContainment(unittest.TestCase):
+    """The plan's `label` is untrusted and names a directory."""
+
+    def setUp(self):
+        self._home = fleet.FLEET_HOME
+
+    def tearDown(self):
+        fleet.FLEET_HOME = self._home
+
+    def test_hostile_label_cannot_escape(self):
+        import tempfile
+        for label in ("../../escaped", "../..", "/abs/path", "a/b", "..", "."):
+            with tempfile.TemporaryDirectory() as td:
+                fleet.FLEET_HOME = Path(td)
+                with self.subTest(label=label):
+                    d = fleet.new_run_dir(label)
+                    self.assertEqual(d.parent, (Path(td) / "runs").resolve(),
+                                     "run dir escaped for label %r" % label)
+                    self.assertTrue(d.is_dir())
+
+    def test_label_is_scrubbed_not_rejected(self):
+        self.assertEqual(fleet.sanitize_label("my batch/v2"), "my-batch-v2")
+        self.assertEqual(fleet.sanitize_label(".."), "run")
+        self.assertEqual(fleet.sanitize_label(""), "run")
+        self.assertEqual(fleet.sanitize_label(None), "None")
+        self.assertLessEqual(len(fleet.sanitize_label("x" * 500)), 48)
+
+    def test_ordinary_label_survives(self):
+        self.assertEqual(fleet.sanitize_label("ratelimit"), "ratelimit")
+
+
+class PlanValidation(unittest.TestCase):
+    """Malformed plans must produce messages, not tracebacks."""
+
+    def good(self):
+        return {"tasks": [{"prompt": "do a thing"}]}
+
+    def test_accepts_a_minimal_plan_and_fills_ids(self):
+        tasks = fleet.validate_plan(self.good())
+        self.assertEqual(tasks[0]["id"], "t1")
+
+    def test_rejects_non_object_plan(self):
+        for plan in ([], "text", 3, None):
+            with self.subTest(plan=plan), self.assertRaisesRegex(ValueError, "JSON object"):
+                fleet.validate_plan(plan)
+
+    def test_rejects_missing_or_empty_tasks(self):
+        for plan in ({}, {"goal": "x"}, {"tasks": []}, {"tasks": "nope"}):
+            with self.subTest(plan=plan), self.assertRaisesRegex(ValueError, "tasks"):
+                fleet.validate_plan(plan)
+
+    def test_rejects_non_object_task(self):
+        with self.assertRaisesRegex(ValueError, "must be an object"):
+            fleet.validate_plan({"tasks": ["just a string"]})
+
+    def test_rejects_missing_or_blank_prompt(self):
+        for task in ({}, {"prompt": ""}, {"prompt": "   "}, {"prompt": 5}):
+            with self.subTest(task=task), self.assertRaisesRegex(ValueError, "prompt"):
+                fleet.validate_plan({"tasks": [task]})
+
+    def test_propagates_duplicate_id_errors(self):
+        with self.assertRaisesRegex(ValueError, "duplicate task id"):
+            fleet.validate_plan({"tasks": [{"id": "a", "prompt": "x"},
+                                           {"id": "a", "prompt": "y"}]})
 
 
 class CommandBuilding(unittest.TestCase):
