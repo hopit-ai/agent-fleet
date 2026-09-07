@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 HERE = Path(__file__).resolve().parent
 FLEET_HOME = Path(os.environ.get("FLEET_HOME", Path.home() / ".fleet"))
@@ -52,6 +52,209 @@ def save_sessions(data):
     tmp = sessions_path().with_name("sessions.json.tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(sessions_path())
+
+
+CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+
+
+def _norm_path(text):
+    """Claude Code encodes a cwd into a directory name by replacing every
+    non-alphanumeric character with '-', which is lossy - so we normalise both
+    sides the same way and confirm against the cwd recorded inside the file."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(text))
+
+
+def _jsonl(path, limit=None):
+    # Both CLIs write UTF-8; without an explicit encoding this follows the
+    # platform locale and silently mis-decodes on non-UTF-8 systems.
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if limit is not None and i >= limit:
+                    return
+                line = line.strip()
+                if line.startswith("{"):
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        return
+
+
+def _message_text(obj, backend):
+    """(role, text) for a real conversation message, else None.
+
+    One definition shared by discovery and the digest, so a turn count means
+    the same thing on both backends - Claude's transcript also files tool
+    results under the `user` type, and those are not turns.
+    """
+    if backend == "claude":
+        if obj.get("type") not in ("user", "assistant"):
+            return None
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text")
+        else:
+            return None
+        text = text.strip()
+        return (obj["type"], text) if text else None
+
+    if obj.get("type") != "response_item":
+        return None
+    pay = obj.get("payload") or {}
+    if pay.get("type") != "message" or pay.get("role") not in ("user", "assistant"):
+        return None
+    text = " ".join(c.get("text", "") for c in pay.get("content", [])
+                    if isinstance(c, dict) and c.get("text")).strip()
+    return (pay["role"], text) if text else None
+
+
+def _scan_transcript(path, backend):
+    """One pass over a transcript: title, cwd, turn count, opening ask.
+
+    Everything the listing needs comes from a single read - scanning again per
+    session would double the I/O of `fleet adopt`, which runs at every startup.
+    """
+    title = cwd = first_ask = None
+    turns = 0
+    for obj in _jsonl(path):
+        if backend == "claude":
+            t = obj.get("type")
+            if t in ("custom-title", "ai-title"):
+                title = obj.get("customTitle") or obj.get("aiTitle") or title
+            if cwd is None and isinstance(obj.get("cwd"), str):
+                cwd = obj["cwd"]
+        elif obj.get("type") == "session_meta":
+            pay = obj.get("payload") or {}
+            cwd = cwd or pay.get("cwd")
+        msg = _message_text(obj, backend)
+        if not msg:
+            continue
+        role, text = msg
+        turns += 1
+        if first_ask is None and role == "user" and not _is_scaffolding(text):
+            first_ask = " ".join(text.split())[:60]
+    return {"title": title, "cwd": cwd, "turns": turns, "first_ask": first_ask}
+
+
+def discover_claude_sessions(cwd):
+    """Prior Claude Code sessions whose recorded cwd matches."""
+    want_dir = _norm_path(Path(cwd).resolve())
+    want_cwd = Path(cwd).resolve()
+    found = []
+    if not CLAUDE_PROJECTS.is_dir():
+        return found
+    for d in CLAUDE_PROJECTS.iterdir():
+        if not d.is_dir() or d.name != want_dir:
+            continue
+        for f in d.glob("*.jsonl"):
+            info = _scan_transcript(f, "claude")
+            if info["cwd"]:
+                try:
+                    if Path(info["cwd"]).resolve() != want_cwd:
+                        continue
+                except OSError:
+                    continue
+            found.append({
+                "backend": "claude", "native_id": f.stem, "path": str(f),
+                "title": info["title"] or info["first_ask"] or "(untitled)",
+                "turns": info["turns"],
+                "updated": datetime.fromtimestamp(f.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+            })
+    return found
+
+
+def _codex_thread_names():
+    """id -> human thread name, from Codex's own session index."""
+    names = {}
+    for obj in _jsonl(Path.home() / ".codex" / "session_index.jsonl"):
+        if obj.get("id") and obj.get("thread_name"):
+            names[obj["id"]] = obj["thread_name"]
+    return names
+
+
+def discover_codex_sessions(cwd):
+    """Prior Codex sessions - each rollout file opens with a session_meta cwd.
+
+    payload.id is this thread's own id and is what `codex exec resume` takes;
+    payload.session_id is the root of the lineage and repeats across resumes,
+    so it must not be used as the resume target.
+    """
+    want = Path(cwd).resolve()
+    names = _codex_thread_names()
+    found = []
+    if not CODEX_SESSIONS.is_dir():
+        return found
+    for f in CODEX_SESSIONS.rglob("rollout-*.jsonl"):
+        meta = None
+        for obj in _jsonl(f, limit=3):
+            if obj.get("type") == "session_meta":
+                meta = obj.get("payload") or {}
+                break
+        if not meta or not meta.get("cwd"):
+            continue
+        try:
+            if Path(meta["cwd"]).resolve() != want:
+                continue
+        except OSError:
+            continue
+        tid = meta.get("id") or meta.get("session_id")
+        info = _scan_transcript(f, "codex")
+        found.append({
+            "backend": "codex", "native_id": tid, "path": str(f),
+            "title": names.get(tid) or info["first_ask"] or "(untitled)",
+            "turns": info["turns"], "root_id": meta.get("session_id"),
+            "updated": datetime.fromtimestamp(f.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
+        })
+    return found
+
+
+def discover_sessions(cwd):
+    all_found = discover_claude_sessions(cwd) + discover_codex_sessions(cwd)
+    return sorted(all_found, key=lambda x: x["updated"], reverse=True)
+
+
+SCAFFOLD_PREFIXES = (
+    "<recommended_plugins", "<app-context", "<environment_context", "<system-reminder",
+    "<ide_context", "<user-prompt-submit-hook", "<command-name", "<local-command",
+    "caveat: the messages below were generated",
+    "the following is the codex agent history",
+    "this session is being continued from a previous conversation",
+)
+
+
+def _is_scaffolding(text):
+    """Harness-injected context, not anything a person said."""
+    head = text.strip()[:120].lower()
+    return any(head.startswith(pfx) for pfx in SCAFFOLD_PREFIXES)
+
+
+def transcript_digest(entry, max_chars=12000):
+    """Flatten a transcript to plain text so the other CLI can pick up context.
+
+    A Claude session cannot literally be resumed inside Codex (or the reverse),
+    so a cross-CLI handoff carries the conversation as text instead.
+    """
+    parts = []
+    for obj in _jsonl(entry["path"]):
+        msg = _message_text(obj, entry["backend"])
+        if not msg:
+            continue
+        role, text = msg
+        if not _is_scaffolding(text):
+            parts.append("%s: %s" % (role.upper(), text))
+
+    text = "\n\n".join(parts)
+    if len(text) > max_chars:
+        head = text[: max_chars // 3]
+        tail = text[-(max_chars * 2 // 3):]
+        text = head + "\n\n[... middle of the transcript omitted ...]\n\n" + tail
+    return text
 
 
 def parse_codex_thread_id(stdout):
@@ -459,6 +662,7 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
         "exit_code": rc,
         "timed_out": timed_out,
         "output": text,
+        "prompt": prompt[:4000] + ("\n... [truncated]" if len(prompt) > 4000 else ""),
     }
     if model["backend"] == "claude":
         result["meta"] = claude_meta(stdout)
@@ -643,7 +847,10 @@ def cmd_run(args):
     run_dir = new_run_dir("run")
     res = run_task(roster, task, run_dir, cwd, args.timeout, args.yolo, args.prefer,
                    verbose=not args.json)
-    (run_dir / "run.json").write_text(json.dumps({"cwd": cwd, "results": [res]}, indent=2))
+    goal = " ".join(task["prompt"].split())[:120] or args.kind
+    single = {"cwd": cwd, "goal": goal, "run_dir": str(run_dir), "results": [res]}
+    (run_dir / "run.json").write_text(json.dumps(single, indent=2))
+    write_receipt(single, run_dir, cwd)
     if args.json:
         print(json.dumps(res, indent=2))
     else:
@@ -696,6 +903,9 @@ def cmd_batch(args):
 
     summary = {"cwd": cwd, "goal": plan.get("goal"), "run_dir": str(run_dir), "results": results}
     Path(run_dir, "run.json").write_text(json.dumps(summary, indent=2))
+    rec = write_receipt(summary, run_dir, cwd)
+    if rec:
+        print("receipt: %s" % rec, file=sys.stderr)
     if args.json:
         print(json.dumps(summary, indent=2))
     else:
@@ -704,6 +914,471 @@ def cmd_batch(args):
             print(r["output"] if r["ok"] else "[FAILED] %s" % r.get("stderr", ""))
     print("\nledger: %s" % run_dir, file=sys.stderr)
     return 0 if all(r["ok"] for r in results) else 1
+
+
+def _nb_id():
+    """nbformat 4.5+ requires a per-cell id; without it validation warns today
+    and fails outright on newer versions."""
+    return uuid.uuid4().hex[:8]
+
+
+def _nb_md(text):
+    return {"id": _nb_id(), "cell_type": "markdown", "metadata": {},
+            "source": text.splitlines(keepends=True)}
+
+
+def _nb_code(source, output=None):
+    outs = []
+    if output:
+        outs = [{"output_type": "stream", "name": "stdout",
+                 "text": output.splitlines(keepends=True)}]
+    return {"id": _nb_id(), "cell_type": "code", "execution_count": None, "metadata": {},
+            "outputs": outs, "source": source.splitlines(keepends=True)}
+
+
+def _fence(text, limit=4000):
+    """A receipt is evidence, so the content is never edited to fit. Pick a
+    fence longer than the longest backtick run rather than altering the text."""
+    text = (text or "").strip()
+    if len(text) > limit:
+        text = text[:limit] + "\n... [truncated]"
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return fence + "\n" + text + "\n" + fence
+
+
+def git_snapshot(cwd):
+    def run(*args):
+        try:
+            r = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=20)
+            return r.stdout.strip() if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    branch = run("git", "rev-parse", "--abbrev-ref", "HEAD")
+    if not branch:
+        return None
+    return {"branch": branch, "head": (run("git", "rev-parse", "--short", "HEAD") or "?"),
+            "diffstat": run("git", "diff", "--stat")}
+
+
+def build_receipt(summary, git_info=None):
+    """A notebook receipt: what was asked, who did it, and what changed.
+
+    Emitted as plain .ipynb JSON, so it needs no notebook libraries installed.
+    """
+    results = summary.get("results", [])
+    ok = sum(1 for r in results if r.get("ok"))
+    cells = [_nb_md(
+        "# Task receipt\n\n"
+        "**Goal:** %s\n\n"
+        "- **Run:** `%s`\n"
+        "- **Working directory:** `%s`\n"
+        "- **Generated:** %s\n"
+        "- **Outcome:** %d of %d task(s) succeeded\n"
+        % (summary.get("goal") or "(not stated)",
+           Path(summary.get("run_dir", "?")).name,
+           summary.get("cwd", "?"),
+           datetime.now(timezone.utc).isoformat(timespec="seconds"),
+           ok, len(results)))]
+
+    if git_info:
+        cells.append(_nb_md(
+            "## Repository state\n\n- **Branch:** `%s`\n- **HEAD:** `%s`\n\n%s\n"
+            % (git_info.get("branch", "?"), git_info.get("head", "?"),
+               _fence(git_info.get("diffstat") or "(no uncommitted changes)"))))
+
+    cells.append(_nb_md("## Delegations\n\nOne section per task, in completion order."))
+    for r in results:
+        cells.append(_nb_md(
+            "### `%s` - %s\n\n"
+            "| field | value |\n|---|---|\n"
+            "| model | `%s` (`%s`) |\n| backend | %s |\n| tier | %s |\n"
+            "| kind / complexity | %s / %s |\n| read-only | %s |\n"
+            "| session | %s |\n| duration | %ss |\n| result | %s |\n"
+            % (r.get("id"), "ok" if r.get("ok") else "FAILED",
+               r.get("model"), r.get("model_id"), r.get("backend"), r.get("tier"),
+               r.get("kind") or "-", r.get("complexity") or "-",
+               "yes" if r.get("readonly") else "no",
+               r.get("session") or "-", r.get("seconds"),
+               "success" if r.get("ok") else "exit %s" % r.get("exit_code"))))
+        if r.get("prompt"):
+            cells.append(_nb_md("**Prompt sent**\n\n" + _fence(r["prompt"])))
+        cells.append(_nb_md("**Response**\n\n"
+                            + _fence(r.get("output") or r.get("stderr") or "(no output)")))
+
+    cells.append(_nb_md(
+        "## Verification\n\n"
+        "_Record what was actually run to check this work - tests, a linter, a manual "
+        "check - and paste the real output below. A receipt with no verification is a "
+        "claim, not evidence._"))
+    cells.append(_nb_code("# e.g. !python -m unittest discover -s tests", None))
+
+    return {"cells": cells, "nbformat": 4, "nbformat_minor": 5,
+            "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
+                                        "name": "python3"},
+                         "language_info": {"name": "python"},
+                         "fleet": {"run_dir": summary.get("run_dir"),
+                                   "generated": datetime.now(timezone.utc).isoformat()}}}
+
+
+def write_receipt(summary, run_dir, cwd):
+    """Best effort - a receipt failure must never take down the run itself."""
+    try:
+        nb = build_receipt(summary, git_snapshot(cwd))
+        path = Path(run_dir) / "receipt.ipynb"
+        path.write_text(json.dumps(nb, indent=1))
+        return path
+    except Exception as e:  # noqa: BLE001
+        print("fleet: could not write receipt (%s)" % e, file=sys.stderr)
+        return None
+
+
+TASK_ROOT = ".fleet/tasks"
+UNDERSTANDING_TEMPLATE = """# What this change is, in plain language
+
+<!-- Written for a person who was not here. No jargon, no model names, no task ids.
+     If a sentence would not survive being read aloud to a new teammate, rewrite it. -->
+
+## What was asked for
+
+## What actually changed
+
+## Why it was done this way
+
+_What alternatives were considered, and why this one won._
+
+## What could go wrong
+
+_Known limits, anything deliberately left out, what to watch after merge._
+
+## How it was checked
+
+_The actual commands run and what they showed._
+"""
+
+
+def _git(cwd, *args):
+    """git reports failures on stderr, so returning stdout alone loses every
+    error message - and any caller branching on the text sees an empty string."""
+    try:
+        r = subprocess.run(("git",) + args, cwd=cwd, capture_output=True, text=True, timeout=30)
+        out = r.stdout.strip() or r.stderr.strip()
+        return (out, r.returncode)
+    except (OSError, subprocess.SubprocessError) as e:
+        return (str(e), 1)
+
+
+def _repo_root(cwd):
+    out, rc = _git(cwd, "rev-parse", "--show-toplevel")
+    return Path(out) if rc == 0 else None
+
+
+def _task_dir(root, slug):
+    return Path(root) / TASK_ROOT / slug
+
+
+def _load_task(root, slug):
+    f = _task_dir(root, slug) / "task.json"
+    try:
+        return json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_task(root, slug, data):
+    d = _task_dir(root, slug)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "task.json").write_text(json.dumps(data, indent=2))
+
+
+def _runs_under(root):
+    """Runs whose recorded cwd is inside this repository, oldest first.
+
+    The receipt is the evidence a task gate demands, so a run from an unrelated
+    project must never be able to satisfy it.
+    """
+    runs_dir = FLEET_HOME / "runs"
+    if not runs_dir.is_dir():
+        return []
+    root = Path(root).resolve()
+    out = []
+    for r in sorted(runs_dir.glob("*")):
+        try:
+            summary = json.loads(Path(r, "run.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not summary.get("cwd"):
+            continue
+        try:
+            run_cwd = Path(summary["cwd"]).resolve()
+        except OSError:
+            continue
+        if run_cwd == root or root in run_cwd.parents:
+            out.append((r, summary))
+    return out
+
+
+def task_gates(root, slug):
+    """The four gates, each independently checkable. No gate is self-reported.
+
+    Merge is the outcome of passing them, not a gate - nothing here may be
+    satisfied by simply asserting it."""
+    d = _task_dir(root, slug)
+    meta = _load_task(root, slug) or {}
+    branch_now, _ = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+
+    understanding = d / "understanding.md"
+    u_text = understanding.read_text() if understanding.is_file() else ""
+    # Strip whole comment blocks: a per-line prefix filter let the middle lines
+    # of the template's guidance comment count as the author's own prose.
+    u_text = re.sub(r"<!--.*?-->", "", u_text, flags=re.S)
+    u_body = "\n".join(l for l in u_text.splitlines()
+                       if l.strip() and not l.strip().startswith(("#", "_")))
+
+    receipt = d / "receipt.ipynb"
+    cell_count = 0
+    if receipt.is_file():
+        try:
+            nb = json.loads(receipt.read_text())
+            if nb.get("metadata", {}).get("fleet"):  # must be a fleet-generated receipt
+                cell_count = len(nb.get("cells", []))
+        except (OSError, json.JSONDecodeError):
+            cell_count = 0
+
+    review = meta.get("review") or {}
+    return [
+        {"gate": "branch", "ok": bool(meta.get("branch")) and branch_now == meta.get("branch"),
+         "detail": "on %s (task branch %s)" % (branch_now or "?", meta.get("branch") or "-")},
+        {"gate": "receipt", "ok": cell_count > 0,
+         "detail": ("%s (%d cells)" % (receipt.name, cell_count)) if receipt.is_file()
+                   else "missing"},
+        {"gate": "review", "ok": review.get("verdict") == "pass",
+         "detail": ("%s by %s" % (review.get("verdict"), review.get("by", "?")))
+                   if review else "not reviewed"},
+        {"gate": "understanding", "ok": understanding.is_file() and len(u_body) >= 200,
+         "detail": ("%d chars of prose" % len(u_body)) if understanding.is_file()
+                   else "missing"},
+    ]
+
+
+def cmd_task(args):
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    root = _repo_root(cwd)
+    if not root:
+        die("not inside a git repository - this workflow is branch-based")
+
+    if args.task_cmd == "list":
+        base = Path(root) / TASK_ROOT
+        slugs = sorted(p.name for p in base.iterdir()) if base.is_dir() else []
+        if not slugs:
+            print("no tasks yet.  start one:  fleet task start <slug>")
+            return 0
+        for sl in slugs:
+            gates = task_gates(root, sl)
+            done = sum(1 for g in gates if g["ok"])
+            print("  %-28s %d/%d gates  %s" % (sl, done, len(gates),
+                  "READY TO MERGE" if done == len(gates) else
+                  "blocked: " + ", ".join(g["gate"] for g in gates if not g["ok"])))
+        return 0
+
+    slug = args.slug
+    if not slug:
+        die("which task? e.g. fleet task %s add-rate-limiting" % args.task_cmd)
+    if not TASK_ID_RE.fullmatch(slug):
+        die("invalid task slug %r (letters, numbers, dots, underscores, hyphens)" % slug)
+
+    if args.task_cmd == "start":
+        branch = args.branch or ("fleet/%s" % slug)
+        # fleet's own task artifacts always leave the tree dirty, so they must
+        # not block starting the next task.
+        dirty_raw, _ = _git(root, "status", "--porcelain")
+        dirty = [l for l in dirty_raw.splitlines()
+                 if l.strip() and TASK_ROOT not in l and not l.split(maxsplit=1)[-1].startswith(".fleet/")]
+        if dirty and not args.allow_dirty:
+            die("working tree has uncommitted changes; commit or stash first "
+                "(or pass --allow-dirty):\n  " + "\n  ".join(dirty[:5]))
+        base_branch, _ = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
+        out, rc = _git(root, "checkout", "-b", branch)
+        if rc != 0 and "already exists" in out.lower():
+            out, rc = _git(root, "checkout", branch)
+        if rc != 0:
+            die("could not switch to %s: %s" % (branch, out))
+        meta = {"slug": slug, "branch": branch, "base": base_branch,
+                "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        _save_task(root, slug, meta)
+        u = _task_dir(root, slug) / "understanding.md"
+        if not u.is_file():
+            u.write_text(UNDERSTANDING_TEMPLATE)
+        print("task %r started" % slug)
+        print("  branch:        %s (from %s)" % (branch, base_branch))
+        print("  understanding: %s  <- fill this in, in plain language" % u.relative_to(root))
+        print("\nNext:  do the work, then  fleet task receipt %s" % slug)
+        return 0
+
+    meta = _load_task(root, slug)
+    if not meta:
+        die("no task %r (start it with: fleet task start %s)" % (slug, slug))
+
+    if args.task_cmd == "receipt":
+        candidates = _runs_under(root)
+        if not candidates:
+            die("no fleet run recorded in %s yet - delegate some work first.\n"
+                "  (runs from other projects are deliberately not offered: the receipt "
+                "is this task's evidence)" % root)
+        if args.run:
+            picked = [(r, sm) for r, sm in candidates if args.run in r.name]
+            if not picked:
+                die("no run matching %r in this repository.\n  available: %s"
+                    % (args.run, ", ".join(r.name for r, _ in candidates[-5:])))
+            target, summary = picked[-1]
+        else:
+            target, summary = candidates[-1]
+        summary.setdefault("run_dir", str(target))
+        nb = build_receipt(summary, git_snapshot(root))
+        out = _task_dir(root, slug) / "receipt.ipynb"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(nb, indent=1))
+        meta["receipt_from"] = target.name
+        _save_task(root, slug, meta)
+        print("receipt attached: %s  (from run %s)" % (out.relative_to(root), target.name))
+        return 0
+
+    if args.task_cmd == "review":
+        if not args.verdict:
+            die("record the orchestrator's verdict: --verdict pass|changes")
+        meta["review"] = {"verdict": args.verdict, "by": args.by or "orchestrator",
+                          "notes": args.notes or "",
+                          "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        _save_task(root, slug, meta)
+        print("review recorded: %s by %s" % (args.verdict, meta["review"]["by"]))
+        if args.verdict != "pass":
+            print("  gate stays closed until the verdict is 'pass'")
+        return 0
+
+    if args.task_cmd == "status":
+        gates = task_gates(root, slug)
+        print("task %r  (branch %s, from %s)\n" % (slug, meta.get("branch"), meta.get("base")))
+        for g in gates:
+            print("  [%s] %-14s %s" % ("x" if g["ok"] else " ", g["gate"], g["detail"]))
+        blocked = [g["gate"] for g in gates if not g["ok"]]
+        print()
+        if blocked:
+            print("NOT ready to merge - open gates: %s" % ", ".join(blocked))
+            return 1
+        print("All gates passed. Merge with:")
+        print("  git checkout %s && git merge --no-ff %s" % (meta.get("base"), meta.get("branch")))
+        return 0
+
+    die("unknown task command %r" % args.task_cmd)
+
+
+def cmd_receipt(args):
+    runs_dir = FLEET_HOME / "runs"
+    runs = sorted(runs_dir.glob("*")) if runs_dir.is_dir() else []
+    if not runs:
+        die("no runs recorded yet")
+    if args.run in (None, "latest"):
+        target = runs[-1]
+    else:
+        target = next((r for r in runs if args.run in r.name), None)
+        if not target:
+            die("no run matching %r" % args.run)
+    try:
+        summary = json.loads(Path(target, "run.json").read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        die("run %s has no readable run.json (%s)" % (target.name, e))
+    summary.setdefault("run_dir", str(target))
+    nb = build_receipt(summary, git_snapshot(summary.get("cwd") or os.getcwd()))
+    out = Path(args.out) if args.out else Path(target) / "receipt.ipynb"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(nb, indent=1))
+    print("receipt: %s (%d cells, %d task(s))"
+          % (out, len(nb["cells"]), len(summary.get("results", []))))
+    return 0
+
+
+def cmd_adopt(args):
+    """Pick up an existing project conversation from either CLI."""
+    roster = load_roster()
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    found = discover_sessions(cwd)
+
+    if not found:
+        print("No prior Claude Code or Codex sessions found for %s" % cwd)
+        return 0
+
+    if not args.id:
+        print("Prior sessions for %s\n" % cwd)
+        print("  %-3s %-7s %-38s %-6s %-20s %s" % ("#", "CLI", "SESSION ID", "TURNS", "UPDATED", "TITLE"))
+        for i, e in enumerate(found, 1):
+            print("  %-3d %-7s %-38s %-6s %-20s %s" % (
+                i, e["backend"], e["native_id"], e["turns"], e["updated"][:19], e["title"][:44]))
+        print("\nResume it here:      fleet adopt %s --as work" % found[0]["native_id"][:8])
+        print("Hand it to the other CLI:  fleet adopt %s --as work --handoff sonnet"
+              % found[0]["native_id"][:8])
+        return 0
+
+    matches = [e for e in found if e["native_id"].startswith(args.id)]
+    if args.id.isdigit() and 1 <= int(args.id) <= len(found):
+        matches = [found[int(args.id) - 1]]
+    if not matches:
+        die("no session here matching %r (run `fleet adopt` to list)" % args.id)
+    if len(matches) > 1:
+        die("%r matches %d sessions; use more characters" % (args.id, len(matches)))
+    entry = matches[0]
+
+    if args.digest_only:
+        print(transcript_digest(entry, args.max_chars))
+        return 0
+
+    name = args.as_name or ("adopted-%s" % entry["native_id"][:8])
+
+    if args.handoff:
+        # Cross-CLI: the conversation cannot be resumed natively on the other
+        # side, so carry it across as text and open a fresh session there.
+        model_key, _ = resolve_model(roster, args.handoff)
+        digest = transcript_digest(entry, args.max_chars)
+        if not digest.strip():
+            die("that session has no readable transcript to hand off")
+        prompt = (
+            "You are picking up a project already in progress. The transcript below is an "
+            "earlier %s session in this same working directory (%s). Read it as context for "
+            "what has already been decided, tried, and built.\n\n"
+            "Reply with a short summary of where the work stands and what you understand the "
+            "next step to be. Do not change any files yet.\n\n"
+            "===== EARLIER %s TRANSCRIPT =====\n%s\n===== END TRANSCRIPT ====="
+            % (entry["backend"], cwd, entry["backend"].upper(), digest))
+        run_dir = new_run_dir("adopt")
+        task = {"id": "handoff", "prompt": prompt, "model": model_key,
+                "session": name, "readonly": True, "cwd": cwd}
+        print("Handing a %s session (%d turns) to %s ..."
+              % (entry["backend"], entry["turns"], model_key), file=sys.stderr)
+        res = run_task(roster, task, run_dir, cwd, args.timeout, False, "auto", verbose=True)
+        print("\n%s" % res["output"])
+        if not res["ok"]:
+            print("[FAILED] %s" % res.get("stderr", ""), file=sys.stderr)
+            return 1
+        print("\nSession %r now continues that work. Next: fleet run \"...\" --session %s"
+              % (name, name), file=sys.stderr)
+        return 0
+
+    # Same CLI: adopt the native id so `--session NAME` resumes it for real.
+    model_key = args.model or roster["tier_defaults"]["mid"].get(entry["backend"])
+    model_key, _ = resolve_model(roster, model_key)
+    if roster["models"][model_key]["backend"] != entry["backend"]:
+        die("session is a %s session; %r runs on %s. Use --handoff to cross CLIs."
+            % (entry["backend"], model_key, roster["models"][model_key]["backend"]))
+    with SESSIONS_LOCK:
+        allsess = load_sessions()
+        allsess[name] = {"name": name, "backend": entry["backend"], "model": model_key,
+                         "cwd": cwd, "native_id": entry["native_id"],
+                         "created": datetime.now(timezone.utc).isoformat(),
+                         "turns": entry["turns"], "adopted_from": entry["path"]}
+        save_sessions(allsess)
+    print("Adopted %s session %s as %r (model %s)."
+          % (entry["backend"], entry["native_id"][:12], name, model_key))
+    print('Continue it with:  fleet run "next instruction" --session %s' % name)
+    return 0
 
 
 def cmd_sessions(args):
@@ -811,6 +1486,36 @@ def main():
     b.add_argument("--max-parallel", type=int)
     common(b)
     b.set_defaults(fn=cmd_batch)
+
+    tk = sub.add_parser("task", help="branch -> receipt -> review -> understanding -> merge")
+    tk.add_argument("task_cmd", choices=["start", "receipt", "review", "status", "list"])
+    tk.add_argument("slug", nargs="?")
+    tk.add_argument("--branch", help="branch name (default fleet/<slug>)")
+    tk.add_argument("--base", help="base branch to merge back into")
+    tk.add_argument("--run", help="fleet run to build the receipt from (default: latest)")
+    tk.add_argument("--verdict", choices=["pass", "changes"], help="orchestrator review outcome")
+    tk.add_argument("--by", help="who reviewed (e.g. fable, astra)")
+    tk.add_argument("--notes", help="review notes")
+    tk.add_argument("--allow-dirty", action="store_true")
+    tk.add_argument("--cwd")
+    tk.set_defaults(fn=cmd_task)
+
+    rc_ = sub.add_parser("receipt", help="write a notebook receipt for a run")
+    rc_.add_argument("--run", help="run id substring, or 'latest' (default)")
+    rc_.add_argument("--out", help="output path (default: receipt.ipynb inside the run dir)")
+    rc_.set_defaults(fn=cmd_receipt)
+
+    ad = sub.add_parser("adopt", help="pick up an existing Claude Code or Codex session for this project")
+    ad.add_argument("id", nargs="?", help="session id prefix, or the row number from the listing")
+    ad.add_argument("--as", dest="as_name", metavar="NAME", help="name to file it under")
+    ad.add_argument("--handoff", metavar="MODEL",
+                    help="carry the transcript to the OTHER CLI and open a session there")
+    ad.add_argument("--model", help="model to resume with (same-CLI adoption)")
+    ad.add_argument("--digest-only", action="store_true", help="just print the transcript digest")
+    ad.add_argument("--max-chars", type=int, default=12000, help="transcript budget (default 12000)")
+    ad.add_argument("--cwd")
+    ad.add_argument("--timeout", type=int, default=900)
+    ad.set_defaults(fn=cmd_adopt)
 
     ss = sub.add_parser("sessions", help="list or forget named sessions")
     ss.add_argument("--forget", metavar="NAME", help="drop one session")

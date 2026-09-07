@@ -26,6 +26,37 @@ Run `fleet models` for the live list, `fleet doctor` for what is installed.
 
 ## Workflow
 
+### 0. First thing: is this project already in flight?
+
+**Do this before planning anything**, at the very start of the skill:
+
+```bash
+fleet adopt
+```
+
+It lists prior Claude Code *and* Codex sessions for this working directory. If
+any come back, **ask the user before doing anything else** — something like:
+
+> This project already has 3 earlier sessions here, most recently a Codex one
+> ("Check project progress", 869 turns, yesterday). Want me to pick up from
+> there, or start fresh?
+
+If they want to continue:
+
+```bash
+fleet adopt <id> --as work                    # same CLI: resumes it for real
+fleet adopt <id> --as work --handoff sonnet   # other CLI: carries the transcript across
+```
+
+Use the plain form when the session is on the CLI you are already running in —
+that resumes the actual conversation. Use `--handoff` to cross CLIs: a Claude
+session cannot literally be resumed inside Codex, so fleet extracts the
+transcript, strips harness scaffolding, and opens a fresh session on the target
+model seeded with it. Either way you end up with a named session you continue
+with `--session work`.
+
+If `fleet adopt` returns nothing, this is a new project — carry on to step 1.
+
 ### 1. Orient (only when something looks wrong)
 
 ```bash
@@ -155,6 +186,60 @@ The pattern worth reaching for is **one session per family**:
 When *not* to use a session: independent parallel tasks. Two tasks sharing a
 session are serialised by that conversation, so give them explicit `deps` — and
 if they don't actually need shared memory, don't give them a session at all.
+
+## The task workflow (mandatory)
+
+Every assigned task follows the same five steps. `fleet task` enforces them —
+`fleet task status` exits non-zero until all four gates pass, so you can check
+rather than assume.
+
+```bash
+fleet task start add-rate-limiting
+```
+
+That cuts a branch (`fleet/<slug>`), refuses to start on a dirty tree, and drops
+an `understanding.md` template in `.fleet/tasks/<slug>/`.
+
+**1. Branch.** Never work on `main`. `fleet task start` does this for you.
+
+**2. Do the work**, delegating as usual with `fleet run` / `fleet batch`.
+
+**3. Receipt — mandatory.** Every run writes `receipt.ipynb` automatically; attach
+the relevant one to the task:
+
+```bash
+fleet task receipt add-rate-limiting
+```
+
+It is a real Jupyter notebook recording the goal, every delegation (model, tier,
+prompt, response, duration, pass/fail), the branch and diffstat, and an empty
+verification cell. **Fill the verification cell in** with what you actually ran
+and what it printed. A receipt with no verification is a claim, not evidence.
+
+**4. Review — by you, the orchestrator.** Read the diff yourself. Run the tests.
+Then record it:
+
+```bash
+fleet task review add-rate-limiting --verdict pass --by fable --notes "..."
+```
+
+`--verdict changes` keeps the gate shut. Do not record `pass` because a delegate
+said it was fine — record it because you checked.
+
+**5. Understanding document — in human language.** Fill in
+`.fleet/tasks/<slug>/understanding.md`: what was asked, what changed, why this
+way, what could go wrong, how it was checked. Write it for a person who was not
+here — no model names, no task ids, no jargon. The gate wants real prose, so an
+untouched template will not pass.
+
+**Then merge:**
+
+```bash
+fleet task status add-rate-limiting   # must exit 0
+```
+
+It prints the merge command once all four gates are green. If it does not,
+something is genuinely missing — fix that rather than merging around it.
 
 ## Cross-family review
 
