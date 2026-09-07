@@ -713,5 +713,123 @@ class ReviewRegressions(unittest.TestCase):
 
 
 
+class LongPathDiscovery(unittest.TestCase):
+    """Claude Code truncates long cwd encodings and appends a hash."""
+
+    def setUp(self):
+        self._orig = fleet.CLAUDE_PROJECTS
+
+    def tearDown(self):
+        fleet.CLAUDE_PROJECTS = self._orig
+
+    def _project(self, root, dirname, cwd):
+        d = Path(root) / dirname
+        d.mkdir(parents=True)
+        (d / "sess.jsonl").write_text(json.dumps(
+            {"type": "user", "cwd": cwd,
+             "message": {"content": [{"type": "text", "text": "hi"}]}}) + "\n")
+        return d
+
+    def test_finds_truncated_and_hashed_directory(self):
+        import tempfile
+        cwd = "/" + "/".join("segment%02d" % i for i in range(40))  # well over 200 chars
+        full = fleet._norm_path(cwd)
+        self.assertGreater(len(full), fleet.CLAUDE_DIR_TRUNCATE)
+        with tempfile.TemporaryDirectory() as td:
+            fleet.CLAUDE_PROJECTS = Path(td)
+            self._project(td, full[:fleet.CLAUDE_DIR_TRUNCATE] + "-ab12cd", cwd)
+            dirs = fleet._claude_project_dirs(cwd)
+            self.assertEqual(len(dirs), 1, "truncated directory was not matched")
+
+    def test_exact_match_still_preferred(self):
+        import tempfile
+        cwd = "/tmp/short"
+        with tempfile.TemporaryDirectory() as td:
+            fleet.CLAUDE_PROJECTS = Path(td)
+            self._project(td, fleet._norm_path(cwd), cwd)
+            self.assertEqual(len(fleet._claude_project_dirs(cwd)), 1)
+
+    def test_falls_back_to_the_recorded_cwd(self):
+        """If the encoding changes again, the transcripts still identify themselves."""
+        import tempfile
+        cwd = "/tmp/whatever"
+        with tempfile.TemporaryDirectory() as td:
+            fleet.CLAUDE_PROJECTS = Path(td)
+            self._project(td, "an-entirely-unrelated-name", cwd)
+            dirs = fleet._claude_project_dirs(cwd)
+            self.assertEqual([d.name for d in dirs], ["an-entirely-unrelated-name"])
+
+    def test_unrelated_directories_are_not_matched(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            fleet.CLAUDE_PROJECTS = Path(td)
+            self._project(td, "-tmp-other", "/tmp/other")
+            self.assertEqual(fleet._claude_project_dirs("/tmp/mine"), [])
+
+
+class ResumeHints(unittest.TestCase):
+    """Delegations are headless, but they leave openable sessions behind."""
+
+    def test_per_backend_commands(self):
+        self.assertEqual(fleet.resume_hint("claude", "abc"), "claude --resume abc")
+        self.assertEqual(fleet.resume_hint("codex", "xyz"), "codex resume xyz")
+
+    def test_no_id_means_no_hint(self):
+        self.assertIsNone(fleet.resume_hint("claude", None))
+        self.assertIsNone(fleet.resume_hint("codex", ""))
+
+    def test_receipt_exposes_the_open_command(self):
+        nb = fleet.build_receipt({"goal": "g", "run_dir": "r", "results": [
+            {"id": "t1", "ok": True, "model": "sonnet", "backend": "claude",
+             "resume_with": "claude --resume abc", "seconds": 1}]})
+        self.assertIn("claude --resume abc", json.dumps(nb))
+
+
+class DecisionsCarry(unittest.TestCase):
+    """Workers get the orchestrator's reasoning, not only its conclusions."""
+
+    def test_context_and_decisions_are_both_rendered(self):
+        out = fleet.decisions_block({"context": "why we are here",
+                                     "decisions": ["use tabs", "no new deps"]})
+        self.assertIn("why we are here", out)
+        self.assertIn("- use tabs", out)
+        self.assertIn("- no new deps", out)
+        self.assertTrue(out.rstrip().endswith("# Your task"),
+                        "the task must come last, after the context")
+
+    def test_a_single_string_is_accepted(self):
+        self.assertIn("- only one thing", fleet.decisions_block({"decisions": "only one thing"}))
+
+    def test_empty_plan_adds_nothing(self):
+        for plan in ({}, {"decisions": []}, {"context": "  "}, {"decisions": ["", "  "]}):
+            self.assertEqual(fleet.decisions_block(plan), "", repr(plan))
+
+    def test_decisions_are_marked_as_settled(self):
+        out = fleet.decisions_block({"decisions": ["x"]})
+        self.assertIn("settled", out.lower())
+        self.assertIn("stop and say so", out.lower(),
+                      "a delegate must escalate rather than silently deviate")
+
+    def test_malformed_fields_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "decisions"):
+            fleet.validate_plan({"tasks": [{"prompt": "x"}], "decisions": {"a": 1}})
+        with self.assertRaisesRegex(ValueError, "context"):
+            fleet.validate_plan({"tasks": [{"prompt": "x"}], "context": ["not a string"]})
+
+    def test_well_formed_fields_pass(self):
+        fleet.validate_plan({"tasks": [{"prompt": "x"}],
+                             "decisions": ["a"], "context": "b"})
+
+    def test_receipt_records_what_was_carried(self):
+        nb = fleet.build_receipt({"goal": "g", "run_dir": "r", "results": [],
+                                  "context": "the background",
+                                  "decisions": ["the constraint"]})
+        text = json.dumps(nb)
+        self.assertIn("Decisions carried into this work", text)
+        self.assertIn("the background", text)
+        self.assertIn("the constraint", text)
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -173,6 +173,43 @@ Three rules decide whether this works well:
 - **Use `readonly` liberally.** Surveys, reviews and audits should never hold a
   write handle.
 
+### Carrying decisions to the workers
+
+A delegate is a fresh process that receives an instruction with no rationale,
+which is how delegated work drifts from what was intended. Plan-level `context`
+and `decisions` are prepended to every task:
+
+```json
+{
+  "goal": "Add rate limiting to the public API",
+  "context": "The API sits behind a shared gateway; per-process limits would not hold.",
+  "decisions": [
+    "Token bucket, not a fixed window - bursts are expected.",
+    "Limits live in config, not in code.",
+    "No new dependencies."
+  ],
+  "tasks": [ ... ]
+}
+```
+
+Workers are told these are settled and instructed to stop and say so rather than
+quietly deviate if one proves impossible. `"inherit_decisions": false` opts a
+single task out. The decisions are recorded in the receipt too, so the reasoning
+sits with the evidence.
+
+### Opening a worker's conversation
+
+Delegations run headless — they do not open in your app. But each one **is** a
+real session in its CLI's own store, and fleet prints how to open it:
+
+```
+ok   [haiku] b in 6.4s   open: claude --resume 7cb052d7-...
+ok   [spark] a in 7.2s   open: codex resume 01a07b9b-...
+```
+
+The same command appears in `fleet sessions` and in every receipt, so any piece
+of delegated work can be read in full afterwards.
+
 ### Task fields
 
 | Field | Meaning |
@@ -189,6 +226,7 @@ Three rules decide whether this works well:
 | `cwd` | per-task working directory |
 | `inherit_context` | set `false` to stop upstream output being injected |
 | `session` | named persistent session — see [Named sessions](#named-sessions) |
+| `inherit_decisions` | set `false` to keep plan-level decisions out of this task |
 
 ## CLI
 
