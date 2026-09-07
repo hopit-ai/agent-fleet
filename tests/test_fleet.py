@@ -1,7 +1,9 @@
 """Unit tests for fleet. No network, no auth, no backends required."""
 
+import argparse
 import importlib.util
 import json
+import os
 import re
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -828,6 +830,115 @@ class DecisionsCarry(unittest.TestCase):
         self.assertIn("Decisions carried into this work", text)
         self.assertIn("the background", text)
         self.assertIn("the constraint", text)
+
+
+
+class ForegroundQueue(unittest.TestCase):
+    """An orchestrator enqueues; one attached session drains, exactly once."""
+
+    def setUp(self):
+        import tempfile
+        self._orig = fleet.FLEET_HOME
+        self._td = tempfile.mkdtemp()
+        fleet.FLEET_HOME = Path(self._td)
+        # cmd_enqueue resolves the cwd, and on macOS a temp dir resolves
+        # through /private - so the test must compare the resolved form.
+        self.cwd = str((Path(self._td) / "proj").resolve())
+        os.makedirs(self.cwd, exist_ok=True)
+        self.cwd = str(Path(self.cwd).resolve())
+
+    def tearDown(self):
+        fleet.FLEET_HOME = self._orig
+
+    def _add(self, prompt="do a thing", **kw):
+        import contextlib, io
+        args = argparse.Namespace(prompt=prompt, cwd=self.cwd, key=kw.get("key"),
+                                  kind="implement", complexity="medium",
+                                  priority=kw.get("priority", 0), label=kw.get("label"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            fleet.cmd_enqueue(args)
+        return fleet.all_queue_tasks(cwd=self.cwd)
+
+    def test_enqueue_then_claim(self):
+        self._add()
+        pending = fleet.all_queue_tasks(cwd=self.cwd, states=("pending",))
+        self.assertEqual(len(pending), 1)
+        got = fleet._claim(pending[0], "sessionA", 600)
+        self.assertIsNotNone(got)
+        self.assertEqual(got["state"], "claimed")
+        self.assertEqual(got["attempts"], 1)
+
+    def test_a_task_cannot_be_claimed_twice(self):
+        self._add()
+        t = fleet.all_queue_tasks(cwd=self.cwd, states=("pending",))[0]
+        self.assertIsNotNone(fleet._claim(t, "A", 600))
+        self.assertIsNone(fleet._claim(t, "B", 600), "two sessions took the same task")
+
+    def test_identical_work_is_not_queued_twice(self):
+        self._add("same work")
+        self._add("same work")
+        self.assertEqual(len(fleet.all_queue_tasks(cwd=self.cwd)), 1)
+
+    def test_an_explicit_key_controls_identity(self):
+        self._add("wording one", key="shared")
+        self._add("wording two", key="shared")
+        self.assertEqual(len(fleet.all_queue_tasks(cwd=self.cwd)), 1)
+
+    def test_higher_priority_is_offered_first(self):
+        self._add("low", label="low")
+        self._add("high", label="high", priority=5)
+        self.assertEqual(fleet.all_queue_tasks(cwd=self.cwd, states=("pending",))[0]["label"], "high")
+
+    def test_in_flight_work_survives_a_reap(self):
+        """The claiming process exits at once; that must not read as a crash."""
+        self._add()
+        t = fleet.all_queue_tasks(cwd=self.cwd, states=("pending",))[0]
+        fleet._claim(t, "A", 600)
+        self.assertEqual(fleet.reap_stale(cwd=self.cwd), [],
+                         "reclaimed work that was still being done - it would run twice")
+
+    def test_an_expired_lease_returns_to_the_queue(self):
+        self._add()
+        t = fleet.all_queue_tasks(cwd=self.cwd, states=("pending",))[0]
+        fleet._claim(t, "A", 0)
+        self.assertEqual(len(fleet.reap_stale(cwd=self.cwd)), 1)
+        self.assertEqual(fleet.all_queue_tasks(cwd=self.cwd)[0]["state"], "pending")
+
+    def test_a_dead_declared_owner_releases_immediately(self):
+        self._add()
+        t = fleet.all_queue_tasks(cwd=self.cwd, states=("pending",))[0]
+        fleet._claim(t, "A", 9999, owner_pid=999999)  # a pid that cannot exist
+        self.assertEqual(len(fleet.reap_stale(cwd=self.cwd)), 1)
+
+    def test_a_reclaimed_task_records_why(self):
+        self._add()
+        t = fleet.all_queue_tasks(cwd=self.cwd, states=("pending",))[0]
+        fleet._claim(t, "A", 0)
+        fleet.reap_stale(cwd=self.cwd)
+        hist = fleet.all_queue_tasks(cwd=self.cwd)[0]["history"]
+        self.assertEqual(hist[-1]["event"], "reclaimed")
+        self.assertIn("expired", hist[-1]["why"])
+
+    def test_tasks_are_scoped_per_project(self):
+        self._add()
+        other = str(Path(self._td) / "elsewhere")
+        os.makedirs(other, exist_ok=True)
+        self.assertEqual(fleet.all_queue_tasks(cwd=other), [],
+                         "another project's work leaked into this queue")
+
+    def test_worker_slot_is_held_by_reattaching(self):
+        fresh = {"session": "A", "attached_at": fleet._iso(), "poll_seconds": 300}
+        self.assertTrue(fleet._worker_is_live(fresh))
+        stale = {"session": "A", "attached_at": "2020-01-01T00:00:00+00:00", "poll_seconds": 300}
+        self.assertFalse(fleet._worker_is_live(stale), "a stale slot must be takeable")
+
+    def test_a_declared_dead_owner_frees_the_slot_at_once(self):
+        rec = {"session": "A", "attached_at": fleet._iso(),
+               "poll_seconds": 300, "owner_pid": 999999}
+        self.assertFalse(fleet._worker_is_live(rec))
+
+    def test_a_slot_with_no_timestamp_is_not_trusted(self):
+        self.assertFalse(fleet._worker_is_live({"session": "A"}))
 
 
 
