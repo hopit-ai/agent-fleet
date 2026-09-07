@@ -31,6 +31,10 @@ Three things fall out of this that you don't get from one model in one app:
   past — and the reverse. This is the highest-value pattern here.
 - **Real parallelism.** Independent tasks run at the same time in separate
   processes, each with its own context window.
+- **Continuity across tools.** A project started in one CLI can be picked up in
+  the other, carrying the actual conversation rather than a re-explanation.
+- **Evidence by default.** Every run writes a notebook receipt recording who did
+  what, with which prompt, and what changed.
 
 A worked example from the repo's own development: a mid-tier Claude model wrote a
 token-bucket rate limiter, a heavy Codex model reviewed it and correctly found
@@ -82,6 +86,15 @@ fleet doctor
 ```bash
 fleet doctor --auth
 ```
+
+If this project has been worked on before — in *either* CLI — pick that up rather
+than starting cold:
+
+```bash
+fleet adopt
+```
+
+See [Picking up an existing project](#picking-up-an-existing-project).
 
 Delegate a single task — routing is automatic from `--kind` and `--complexity`:
 
@@ -237,6 +250,9 @@ every previous round and can say "you reintroduced the bug from two rounds ago."
 Sessions work in plan files too, via `"session": "name"`. Note that two tasks
 sharing a session are serialised by that session's conversation — give them
 `deps` so the ordering is explicit rather than accidental.
+
+To start a named session from work that already happened — in this CLI or the
+other one — see [Picking up an existing project](#picking-up-an-existing-project).
 
 Under the hood: `claude --session-id/--resume` and `codex exec resume`. Session
 ids are recorded in `~/.fleet/sessions.json`; `fleet sessions --forget NAME`
