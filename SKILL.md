@@ -207,6 +207,67 @@ Include what the previous attempt produced and why it was wrong. Two failures
 at the same tier means the task is under-specified, not that the model is too
 small — rewrite the prompt before spending a bigger model on it.
 
+## Draining the foreground queue
+
+Delegations normally run headless. Sometimes the opposite is wanted: work that
+runs **in this conversation**, where the user can watch the prompts, the tool
+calls and the results as they happen. That is what the queue is for — an
+orchestrator enqueues, and an attached session executes in the foreground.
+
+### Attaching
+
+```bash
+fleet queue attach --worker "<a name for this session>" --poll 300
+```
+
+Then start the drain loop, matching the interval:
+
+```
+/loop 5m drain the fleet queue for this project
+```
+
+**One session per project.** A second `attach` is refused while the first is
+still polling — two drainers would run the same task twice. If you are told a
+worker is already attached, that is not an error to work around: it means the
+work is already being picked up.
+
+### Each tick
+
+1. `fleet queue attach --worker "<same name>" --poll 300` — re-attach. The slot
+   is held by re-attaching, not by a running process, so skipping this releases
+   it after two missed polls.
+2. `fleet queue next --json` — claims one task atomically. Two sessions can
+   never get the same task.
+3. **If a task comes back**, tell the user what you picked up, then **do the work
+   here** — real tool calls in this conversation, not a headless delegation.
+   Visibility is the entire point; `fleet run` would hide it again.
+   - On long work call `fleet queue beat <id>` so the lease does not expire
+     underneath you.
+   - Finish with `fleet queue done <id> --summary "..."` or
+     `fleet queue fail <id> --error "..."`. The summary is what the user sees in
+     the completion notification, so write it for them, not for a log.
+4. **If nothing is pending**, say so briefly and let the loop tick again.
+
+### Why marking the outcome matters
+
+A claim is a lease. If a task is never marked done, it returns to `pending` when
+the lease expires and **runs a second time**. Always close it out — a failure
+recorded honestly is better than a task silently repeating.
+
+That same rule is the crash recovery: if this session dies mid-task, nothing
+beats the lease, and the work returns to the queue by itself.
+
+### Enqueuing
+
+```bash
+fleet enqueue "Add a /health endpoint with a smoke test" --label health
+```
+
+Re-enqueuing identical work in the same directory is refused rather than
+duplicated. Pass `--key` to control that yourself, or `--priority` to jump the
+line. `fleet queue list` shows what is waiting; `fleet queue status` shows
+whether anyone is actually draining it.
+
 ## Named sessions (continuity)
 
 By default each delegation is a fresh process with no memory — good for fan-out,
