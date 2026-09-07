@@ -66,8 +66,10 @@ def _norm_path(text):
 
 
 def _jsonl(path, limit=None):
+    # Both CLIs write UTF-8; without an explicit encoding this follows the
+    # platform locale and silently mis-decodes on non-UTF-8 systems.
     try:
-        with open(path, errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             for i, line in enumerate(fh):
                 if limit is not None and i >= limit:
                     return
@@ -81,30 +83,87 @@ def _jsonl(path, limit=None):
         return
 
 
+def _message_text(obj, backend):
+    """(role, text) for a real conversation message, else None.
+
+    One definition shared by discovery and the digest, so a turn count means
+    the same thing on both backends - Claude's transcript also files tool
+    results under the `user` type, and those are not turns.
+    """
+    if backend == "claude":
+        if obj.get("type") not in ("user", "assistant"):
+            return None
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text")
+        else:
+            return None
+        text = text.strip()
+        return (obj["type"], text) if text else None
+
+    if obj.get("type") != "response_item":
+        return None
+    pay = obj.get("payload") or {}
+    if pay.get("type") != "message" or pay.get("role") not in ("user", "assistant"):
+        return None
+    text = " ".join(c.get("text", "") for c in pay.get("content", [])
+                    if isinstance(c, dict) and c.get("text")).strip()
+    return (pay["role"], text) if text else None
+
+
+def _scan_transcript(path, backend):
+    """One pass over a transcript: title, cwd, turn count, opening ask.
+
+    Everything the listing needs comes from a single read - scanning again per
+    session would double the I/O of `fleet adopt`, which runs at every startup.
+    """
+    title = cwd = first_ask = None
+    turns = 0
+    for obj in _jsonl(path):
+        if backend == "claude":
+            t = obj.get("type")
+            if t in ("custom-title", "ai-title"):
+                title = obj.get("customTitle") or obj.get("aiTitle") or title
+            if cwd is None and isinstance(obj.get("cwd"), str):
+                cwd = obj["cwd"]
+        elif obj.get("type") == "session_meta":
+            pay = obj.get("payload") or {}
+            cwd = cwd or pay.get("cwd")
+        msg = _message_text(obj, backend)
+        if not msg:
+            continue
+        role, text = msg
+        turns += 1
+        if first_ask is None and role == "user" and not _is_scaffolding(text):
+            first_ask = " ".join(text.split())[:60]
+    return {"title": title, "cwd": cwd, "turns": turns, "first_ask": first_ask}
+
+
 def discover_claude_sessions(cwd):
     """Prior Claude Code sessions whose recorded cwd matches."""
-    want = _norm_path(Path(cwd).resolve())
+    want_dir = _norm_path(Path(cwd).resolve())
+    want_cwd = Path(cwd).resolve()
     found = []
     if not CLAUDE_PROJECTS.is_dir():
         return found
     for d in CLAUDE_PROJECTS.iterdir():
-        if not d.is_dir() or d.name != want:
+        if not d.is_dir() or d.name != want_dir:
             continue
         for f in d.glob("*.jsonl"):
-            title, real_cwd, turns = None, None, 0
-            for obj in _jsonl(f, limit=400):
-                t = obj.get("type")
-                if t in ("custom-title", "ai-title"):
-                    title = obj.get("customTitle") or obj.get("aiTitle") or title
-                if isinstance(obj.get("cwd"), str):
-                    real_cwd = obj["cwd"]
-                if t in ("user", "assistant"):
-                    turns += 1
-            if real_cwd and Path(real_cwd).resolve() != Path(cwd).resolve():
-                continue
+            info = _scan_transcript(f, "claude")
+            if info["cwd"]:
+                try:
+                    if Path(info["cwd"]).resolve() != want_cwd:
+                        continue
+                except OSError:
+                    continue
             found.append({
                 "backend": "claude", "native_id": f.stem, "path": str(f),
-                "title": title or "(untitled)", "turns": turns,
+                "title": info["title"] or info["first_ask"] or "(untitled)",
+                "turns": info["turns"],
                 "updated": datetime.fromtimestamp(f.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
             })
     return found
@@ -145,48 +204,18 @@ def discover_codex_sessions(cwd):
         except OSError:
             continue
         tid = meta.get("id") or meta.get("session_id")
-        turns = sum(1 for o in _jsonl(f)
-                    if o.get("type") == "response_item"
-                    and (o.get("payload") or {}).get("type") == "message"
-                    and (o.get("payload") or {}).get("role") in ("user", "assistant"))
+        info = _scan_transcript(f, "codex")
         found.append({
             "backend": "codex", "native_id": tid, "path": str(f),
-            "title": names.get(tid) or "(untitled)", "turns": turns,
-            "root_id": meta.get("session_id"),
+            "title": names.get(tid) or info["first_ask"] or "(untitled)",
+            "turns": info["turns"], "root_id": meta.get("session_id"),
             "updated": datetime.fromtimestamp(f.stat().st_mtime, timezone.utc).isoformat(timespec="seconds"),
         })
     return found
 
 
-def _first_user_line(entry, limit=60):
-    """Fall back to the opening ask when a session has no recorded title."""
-    for obj in _jsonl(entry["path"], limit=600):
-        text = None
-        if entry["backend"] == "claude" and obj.get("type") == "user":
-            content = (obj.get("message") or {}).get("content")
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                text = " ".join(c.get("text", "") for c in content
-                                if isinstance(c, dict) and c.get("type") == "text")
-        elif entry["backend"] == "codex" and obj.get("type") == "response_item":
-            pay = obj.get("payload") or {}
-            if pay.get("type") == "message" and pay.get("role") == "user":
-                text = " ".join(c.get("text", "") for c in pay.get("content", [])
-                                if isinstance(c, dict) and c.get("text"))
-        if text:
-            text = " ".join(text.split())
-            if text.startswith("<") or text.startswith("Caveat:"):
-                continue  # tool/system scaffolding, not the user's ask
-            return text[:limit]
-    return None
-
-
 def discover_sessions(cwd):
     all_found = discover_claude_sessions(cwd) + discover_codex_sessions(cwd)
-    for e in all_found:
-        if e["title"] in ("(untitled)", "", None):
-            e["title"] = _first_user_line(e) or "(untitled)"
     return sorted(all_found, key=lambda x: x["updated"], reverse=True)
 
 
@@ -212,33 +241,13 @@ def transcript_digest(entry, max_chars=12000):
     so a cross-CLI handoff carries the conversation as text instead.
     """
     parts = []
-
-    def add(role, text):
-        text = (text or "").strip()
-        if text and not _is_scaffolding(text):
-            parts.append("%s: %s" % (role.upper(), text))
-
     for obj in _jsonl(entry["path"]):
-        if entry["backend"] == "claude":
-            if obj.get("type") not in ("user", "assistant"):
-                continue
-            msg = obj.get("message") or {}
-            content = msg.get("content")
-            if isinstance(content, str):
-                add(obj["type"], content)
-            elif isinstance(content, list):
-                add(obj["type"], " ".join(
-                    c.get("text", "") for c in content
-                    if isinstance(c, dict) and c.get("type") == "text"))
-        else:
-            if obj.get("type") != "response_item":
-                continue
-            pay = obj.get("payload") or {}
-            if pay.get("type") != "message" or pay.get("role") not in ("user", "assistant"):
-                continue
-            add(pay["role"], " ".join(
-                c.get("text", "") for c in pay.get("content", [])
-                if isinstance(c, dict) and c.get("text")))
+        msg = _message_text(obj, entry["backend"])
+        if not msg:
+            continue
+        role, text = msg
+        if not _is_scaffolding(text):
+            parts.append("%s: %s" % (role.upper(), text))
 
     text = "\n\n".join(parts)
     if len(text) > max_chars:
@@ -838,7 +847,8 @@ def cmd_run(args):
     run_dir = new_run_dir("run")
     res = run_task(roster, task, run_dir, cwd, args.timeout, args.yolo, args.prefer,
                    verbose=not args.json)
-    single = {"cwd": cwd, "goal": args.kind, "run_dir": str(run_dir), "results": [res]}
+    goal = " ".join(task["prompt"].split())[:120] or args.kind
+    single = {"cwd": cwd, "goal": goal, "run_dir": str(run_dir), "results": [res]}
     (run_dir / "run.json").write_text(json.dumps(single, indent=2))
     write_receipt(single, run_dir, cwd)
     if args.json:
@@ -927,10 +937,14 @@ def _nb_code(source, output=None):
 
 
 def _fence(text, limit=4000):
+    """A receipt is evidence, so the content is never edited to fit. Pick a
+    fence longer than the longest backtick run rather than altering the text."""
     text = (text or "").strip()
     if len(text) > limit:
         text = text[:limit] + "\n... [truncated]"
-    return "```\n" + text.replace("```", "``​`") + "\n```"
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return fence + "\n" + text + "\n" + fence
 
 
 def git_snapshot(cwd):
@@ -1044,9 +1058,12 @@ _The actual commands run and what they showed._
 
 
 def _git(cwd, *args):
+    """git reports failures on stderr, so returning stdout alone loses every
+    error message - and any caller branching on the text sees an empty string."""
     try:
         r = subprocess.run(("git",) + args, cwd=cwd, capture_output=True, text=True, timeout=30)
-        return (r.stdout.strip(), r.returncode)
+        out = r.stdout.strip() or r.stderr.strip()
+        return (out, r.returncode)
     except (OSError, subprocess.SubprocessError) as e:
         return (str(e), 1)
 
@@ -1074,32 +1091,67 @@ def _save_task(root, slug, data):
     (d / "task.json").write_text(json.dumps(data, indent=2))
 
 
+def _runs_under(root):
+    """Runs whose recorded cwd is inside this repository, oldest first.
+
+    The receipt is the evidence a task gate demands, so a run from an unrelated
+    project must never be able to satisfy it.
+    """
+    runs_dir = FLEET_HOME / "runs"
+    if not runs_dir.is_dir():
+        return []
+    root = Path(root).resolve()
+    out = []
+    for r in sorted(runs_dir.glob("*")):
+        try:
+            summary = json.loads(Path(r, "run.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not summary.get("cwd"):
+            continue
+        try:
+            run_cwd = Path(summary["cwd"]).resolve()
+        except OSError:
+            continue
+        if run_cwd == root or root in run_cwd.parents:
+            out.append((r, summary))
+    return out
+
+
 def task_gates(root, slug):
-    """The five gates, each independently checkable. No gate is self-reported."""
+    """The four gates, each independently checkable. No gate is self-reported.
+
+    Merge is the outcome of passing them, not a gate - nothing here may be
+    satisfied by simply asserting it."""
     d = _task_dir(root, slug)
     meta = _load_task(root, slug) or {}
     branch_now, _ = _git(root, "rev-parse", "--abbrev-ref", "HEAD")
 
     understanding = d / "understanding.md"
     u_text = understanding.read_text() if understanding.is_file() else ""
+    # Strip whole comment blocks: a per-line prefix filter let the middle lines
+    # of the template's guidance comment count as the author's own prose.
+    u_text = re.sub(r"<!--.*?-->", "", u_text, flags=re.S)
     u_body = "\n".join(l for l in u_text.splitlines()
-                       if l.strip() and not l.strip().startswith(("#", "<!--", "_", "-->")))
+                       if l.strip() and not l.strip().startswith(("#", "_")))
 
     receipt = d / "receipt.ipynb"
-    r_tasks = 0
+    cell_count = 0
     if receipt.is_file():
         try:
             nb = json.loads(receipt.read_text())
-            r_tasks = len(nb.get("metadata", {}).get("fleet", {})) and len(nb.get("cells", []))
+            if nb.get("metadata", {}).get("fleet"):  # must be a fleet-generated receipt
+                cell_count = len(nb.get("cells", []))
         except (OSError, json.JSONDecodeError):
-            r_tasks = 0
+            cell_count = 0
 
     review = meta.get("review") or {}
     return [
         {"gate": "branch", "ok": bool(meta.get("branch")) and branch_now == meta.get("branch"),
          "detail": "on %s (task branch %s)" % (branch_now or "?", meta.get("branch") or "-")},
-        {"gate": "receipt", "ok": receipt.is_file() and r_tasks > 0,
-         "detail": ("%s (%d cells)" % (receipt.name, r_tasks)) if receipt.is_file() else "missing"},
+        {"gate": "receipt", "ok": cell_count > 0,
+         "detail": ("%s (%d cells)" % (receipt.name, cell_count)) if receipt.is_file()
+                   else "missing"},
         {"gate": "review", "ok": review.get("verdict") == "pass",
          "detail": ("%s by %s" % (review.get("verdict"), review.get("by", "?")))
                    if review else "not reviewed"},
@@ -1168,18 +1220,19 @@ def cmd_task(args):
         die("no task %r (start it with: fleet task start %s)" % (slug, slug))
 
     if args.task_cmd == "receipt":
-        runs_dir = FLEET_HOME / "runs"
-        runs = sorted(runs_dir.glob("*")) if runs_dir.is_dir() else []
+        candidates = _runs_under(root)
+        if not candidates:
+            die("no fleet run recorded in %s yet - delegate some work first.\n"
+                "  (runs from other projects are deliberately not offered: the receipt "
+                "is this task's evidence)" % root)
         if args.run:
-            target = next((r for r in runs if args.run in r.name), None)
+            picked = [(r, sm) for r, sm in candidates if args.run in r.name]
+            if not picked:
+                die("no run matching %r in this repository.\n  available: %s"
+                    % (args.run, ", ".join(r.name for r, _ in candidates[-5:])))
+            target, summary = picked[-1]
         else:
-            target = runs[-1] if runs else None
-        if not target:
-            die("no fleet run to build a receipt from (run one, or pass --run)")
-        try:
-            summary = json.loads(Path(target, "run.json").read_text())
-        except (OSError, json.JSONDecodeError) as e:
-            die("run %s has no readable run.json (%s)" % (target.name, e))
+            target, summary = candidates[-1]
         summary.setdefault("run_dir", str(target))
         nb = build_receipt(summary, git_snapshot(root))
         out = _task_dir(root, slug) / "receipt.ipynb"

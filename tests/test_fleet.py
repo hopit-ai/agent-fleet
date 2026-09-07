@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -608,6 +609,108 @@ class TaskGates(unittest.TestCase):
         (d / "understanding.md").write_text(
             fleet.UNDERSTANDING_TEMPLATE + "\n" + ("We changed how errors surface. " * 12))
         self.assertTrue(self.gates()["understanding"])
+
+
+class ReviewRegressions(unittest.TestCase):
+    """Each of these pins a defect found in review of the original change."""
+
+    def test_git_errors_are_not_swallowed(self):
+        """git reports failures on stderr; returning stdout alone lost them."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            out, rc = fleet._git(td, "rev-parse", "--abbrev-ref", "HEAD")
+            self.assertNotEqual(rc, 0)
+            self.assertTrue(out.strip(), "an error with no message is unactionable")
+
+    def test_fence_never_edits_the_content_it_records(self):
+        """A receipt is evidence, so no invisible characters may be injected."""
+        body = "text\n```python\nx = 1\n```\nmore"
+        out = fleet._fence(body)
+        self.assertNotIn("​", out, "zero-width space injected into recorded output")
+        self.assertIn("```python\nx = 1\n```", out, "original content must survive verbatim")
+        self.assertTrue(out.startswith("````"), "fence must outgrow the content's backticks")
+
+    def test_fence_handles_longer_backtick_runs(self):
+        out = fleet._fence("a ````` b")
+        self.assertTrue(out.startswith("`" * 6))
+        self.assertIn("`````", out)
+
+    def test_understanding_gate_ignores_comment_blocks(self):
+        """The template's guidance comment must not count as the author's prose."""
+        stripped = re.sub(r"<!--.*?-->", "", fleet.UNDERSTANDING_TEMPLATE, flags=re.S)
+        body = "\n".join(l for l in stripped.splitlines()
+                         if l.strip() and not l.strip().startswith(("#", "_")))
+        self.assertEqual(len(body), 0,
+                         "an untouched template must contribute nothing toward the gate")
+
+    def test_turn_counting_is_the_same_on_both_backends(self):
+        """Claude files tool results under the `user` type; those are not turns."""
+        claude_tool_result = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "output"}]}}
+        self.assertIsNone(fleet._message_text(claude_tool_result, "claude"))
+        claude_real = {"type": "user", "message": {"content": [
+            {"type": "text", "text": "hello"}]}}
+        self.assertEqual(fleet._message_text(claude_real, "claude"), ("user", "hello"))
+        codex_real = {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": [{"text": "hello"}]}}
+        self.assertEqual(fleet._message_text(codex_real, "codex"), ("user", "hello"))
+
+    def test_empty_messages_are_not_counted(self):
+        blank = {"type": "assistant", "message": {"content": [{"type": "text", "text": "  "}]}}
+        self.assertIsNone(fleet._message_text(blank, "claude"))
+
+    def test_scan_reports_turns_title_and_opening_ask_in_one_pass(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "s.jsonl"
+            f.write_text("\n".join(
+                [json.dumps({"type": "ai-title", "aiTitle": "Fix the parser"}),
+                 json.dumps({"type": "user", "cwd": td,
+                             "message": {"content": [{"type": "text", "text": "<app-context>x"}]}}),
+                 json.dumps({"type": "user",
+                             "message": {"content": [{"type": "text", "text": "fix the parser"}]}}),
+                 json.dumps({"type": "assistant",
+                             "message": {"content": [{"type": "text", "text": "ok"}]}})]))
+            info = fleet._scan_transcript(f, "claude")
+            self.assertEqual(info["title"], "Fix the parser")
+            self.assertEqual(info["cwd"], td)
+            self.assertEqual(info["turns"], 3)
+            self.assertEqual(info["first_ask"], "fix the parser",
+                             "scaffolding must not be mistaken for the opening ask")
+
+    def test_transcripts_are_read_as_utf8(self):
+        """Both CLIs write UTF-8; locale-dependent decoding corrupts it silently."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "s.jsonl"
+            f.write_bytes(json.dumps(
+                {"type": "user", "message": {"content": [{"type": "text",
+                                                          "text": "café — naïve"}]}}
+            ).encode("utf-8") + b"\n")
+            out = fleet.transcript_digest({"backend": "claude", "path": str(f)})
+            self.assertIn("café — naïve", out)
+
+    def test_runs_are_scoped_to_the_repository(self):
+        """A run from another project must not be able to satisfy a task gate."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as repo:
+            orig = fleet.FLEET_HOME
+            try:
+                fleet.FLEET_HOME = Path(home)
+                runs = Path(home) / "runs"
+                (runs / "a-inside").mkdir(parents=True)
+                (runs / "a-inside" / "run.json").write_text(
+                    json.dumps({"cwd": str(Path(repo) / "sub"), "results": []}))
+                (runs / "b-outside").mkdir(parents=True)
+                (runs / "b-outside" / "run.json").write_text(
+                    json.dumps({"cwd": tempfile.gettempdir(), "results": []}))
+                names = [r.name for r, _ in fleet._runs_under(repo)]
+                self.assertIn("a-inside", names)
+                self.assertNotIn("b-outside", names,
+                                 "a run from another project leaked into this repo's evidence")
+            finally:
+                fleet.FLEET_HOME = orig
+
 
 
 if __name__ == "__main__":
