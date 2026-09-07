@@ -240,6 +240,8 @@ of delegated work can be read in full afterwards.
 | `fleet adopt` | list prior Claude Code / Codex sessions here; adopt or hand one off |
 | `fleet sessions` | list named sessions; `--forget NAME` / `--forget-all` |
 | `fleet task start\|receipt\|review\|status\|list` | the gated task workflow |
+| `fleet enqueue <prompt>` | queue work for the attached foreground session |
+| `fleet queue <cmd>` | `list` `next` `done` `fail` `beat` `reap` `attach` `status` |
 | `fleet receipt` | write a notebook receipt for a run |
 | `fleet ledger [--show ID]` | past runs |
 
@@ -370,6 +372,60 @@ Both live in the repo, next to the code they describe:
 **Commit them.** They are the evidence for the change, and they are worth more in
 the history than in a scratch directory. `fleet task start` deliberately ignores
 these files when it checks for a dirty tree, so they never block the next task.
+
+## Foreground work: the queue
+
+Delegations run headless, which is right for fan-out and wrong when you want to
+*watch* the work. The queue inverts it: an orchestrator enqueues, and an attached
+session executes **in its own conversation**, where every prompt, tool call and
+result is visible.
+
+```bash
+fleet enqueue "Add a /health endpoint with a smoke test" --label health
+```
+
+In the session that should do the work:
+
+```bash
+fleet queue attach --worker my-session --poll 300
+```
+
+then run a drain loop at the same interval — `/loop 5m` — which each tick
+re-attaches, calls `fleet queue next --json`, does any claimed work in the
+conversation, and closes it with `fleet queue done <id> --summary "..."`.
+
+There is no UI automation and no external controller: the session polls, claims
+and executes on its own.
+
+### What it guarantees
+
+- **Exactly one execution.** Claims are taken with `O_EXCL`; six workers racing
+  for four tasks take one each. Enqueuing identical work in the same directory
+  returns the existing task rather than adding a second.
+- **One drainer per project.** A second `attach` is refused while the first is
+  still polling, so an orchestrator cannot start a competing controller.
+- **Recovery from a crash.** A claim is a lease held by *heartbeat*, not by a
+  process — the claiming command exits immediately, so treating its exit as a
+  crash would reclaim work mid-flight and run it twice. If a session dies,
+  nothing renews the lease and the task returns to `pending` within its TTL
+  (30 minutes by default, `--lease` to change). Pass `--owner-pid` when you do
+  have a long-lived process and want release to be immediate.
+- **Notifications on completion**, via Notification Center, so they arrive with
+  the screen locked as long as the machine is awake.
+
+```bash
+fleet queue status
+```
+
+```
+queue: done=1, pending=2
+worker: my-session - holding the slot (last seen 2026-09-07T17:02:29+00:00, poll 300s)
+```
+
+**The trade-off:** the session polls, it cannot be pushed. Nothing external may
+inject a turn into a running session without UI automation, so pickup latency is
+bounded by the poll interval — five minutes by default. Lower `--poll` for a
+tighter loop.
 
 ## Safety
 

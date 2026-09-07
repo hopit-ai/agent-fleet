@@ -9,6 +9,7 @@ Stdlib only. No network of its own.
 """
 
 import argparse
+import hashlib
 import concurrent.futures as futures
 import json
 import os
@@ -20,10 +21,10 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 HERE = Path(__file__).resolve().parent
 FLEET_HOME = Path(os.environ.get("FLEET_HOME", Path.home() / ".fleet"))
@@ -1416,6 +1417,312 @@ def cmd_receipt(args):
     return 0
 
 
+QUEUE_STATES = ("pending", "claimed", "done", "failed", "cancelled")
+DEFAULT_POLL_SECONDS = 300
+DEFAULT_LEASE_SECONDS = 1800
+
+
+def queue_dir():
+    d = FLEET_HOME / "queue" / "tasks"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def worker_dir():
+    d = FLEET_HOME / "queue" / "workers"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _iso(dt=None):
+    return (dt or _now()).isoformat(timespec="seconds")
+
+
+def _pid_alive(pid):
+    """A dead owner is how we tell a crash from slow work."""
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _write_atomic(path, data):
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def load_queue_task(tid):
+    try:
+        return json.loads((queue_dir() / ("%s.json" % tid)).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def all_queue_tasks(cwd=None, states=None):
+    out = []
+    for f in sorted(queue_dir().glob("*.json")):
+        if f.name.endswith(".tmp"):
+            continue
+        try:
+            t = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if states and t.get("state") not in states:
+            continue
+        if cwd and t.get("cwd") != cwd:
+            continue
+        out.append(t)
+    out.sort(key=lambda t: (-int(t.get("priority", 0)), t.get("created", "")))
+    return out
+
+
+def notify(title, message):
+    """Notification Center holds these while the screen is locked."""
+    if os.environ.get("FLEET_NOTIFY", "1") == "0":
+        return
+    try:
+        subprocess.run(
+            ["osascript", "-e", "display notification %s with title %s"
+             % (json.dumps(message[:200]), json.dumps(title[:80]))],
+            capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def reap_stale(cwd=None, verbose=False):
+    """Reclaim tasks whose owner died or whose lease expired.
+
+    This is the crash recovery: a claim is only good while its owner is alive
+    and keeps beating, so an interrupted session releases its work by itself.
+    """
+    reclaimed = []
+    for t in all_queue_tasks(cwd=cwd, states=("claimed",)):
+        lease = t.get("lease") or {}
+        expires = lease.get("expires_at", "")
+        # Timestamps are second-granularity, so a lease that runs out in this
+        # very second is already over.
+        expired = bool(expires) and expires <= _iso()
+
+        # Liveness is the heartbeat, not the process that made the claim: the
+        # claiming CLI invocation exits immediately, and treating that as a
+        # crash would reclaim work while the session is still doing it - the
+        # duplicate execution this queue exists to prevent. A pid is only
+        # consulted when the caller supplied a long-lived one.
+        owner_pid = lease.get("pid")
+        owner_dead = owner_pid is not None and not _pid_alive(owner_pid)
+
+        if not expired and not owner_dead:
+            continue
+        why = "owner pid %s gone" % owner_pid if owner_dead else "lease expired at %s" % expires
+        t["state"] = "pending"
+        t["lease"] = None
+        t.setdefault("history", []).append(
+            {"at": _iso(), "event": "reclaimed", "why": why})
+        _write_atomic(queue_dir() / ("%s.json" % t["id"]), t)
+        reclaimed.append(t["id"])
+        if verbose:
+            print("  reclaimed %s (%s)" % (t["id"], t["history"][-1]["why"]), file=sys.stderr)
+    return reclaimed
+
+
+def _worker_is_live(record):
+    """A worker holds its slot by re-attaching, within a grace of two polls.
+
+    An explicitly supplied long-lived pid short-circuits this: if that process
+    is gone the slot is free immediately.
+    """
+    if record.get("owner_pid") is not None:
+        return _pid_alive(record["owner_pid"])
+    poll = int(record.get("poll_seconds") or DEFAULT_POLL_SECONDS)
+    try:
+        seen = datetime.fromisoformat(record["attached_at"])
+    except (KeyError, ValueError, TypeError):
+        return False
+    return (_now() - seen).total_seconds() < poll * 2 + 60
+
+
+def cmd_enqueue(args):
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    key = args.key or hashlib.sha256(
+        ("%s\n%s" % (cwd, args.prompt.strip())).encode("utf-8")).hexdigest()[:16]
+
+    # Idempotency: the same work must not queue twice.
+    for t in all_queue_tasks(cwd=cwd, states=("pending", "claimed")):
+        if t.get("key") == key:
+            print("already queued as %s (%s) - not adding a duplicate"
+                  % (t["id"], t["state"]))
+            return 0
+
+    tid = _now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    task = {
+        "id": tid, "key": key, "state": "pending", "cwd": cwd,
+        "prompt": args.prompt, "kind": args.kind, "complexity": args.complexity,
+        "priority": args.priority, "label": args.label,
+        "created": _iso(), "attempts": 0, "lease": None,
+        "history": [{"at": _iso(), "event": "enqueued"}],
+    }
+    _write_atomic(queue_dir() / ("%s.json" % tid), task)
+    print("queued %s  (%s)" % (tid, args.label or args.kind))
+    print("  the attached session will pick it up on its next poll")
+    return 0
+
+
+def _claim(task, worker, lease_seconds, owner_pid=None):
+    """Atomic claim via O_EXCL - two workers cannot take the same task."""
+    lock = queue_dir() / ("%s.claim" % task["id"])
+    try:
+        fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return None
+    try:
+        os.write(fd, ("%s\n%d\n" % (worker, os.getpid())).encode())
+    finally:
+        os.close(fd)
+
+    fresh = load_queue_task(task["id"])
+    if not fresh or fresh.get("state") != "pending":
+        lock.unlink(missing_ok=True)
+        return None
+    fresh["state"] = "claimed"
+    fresh["attempts"] = int(fresh.get("attempts", 0)) + 1
+    fresh["lease"] = {
+        "worker": worker,
+        # Only a caller-supplied, long-lived pid is worth watching; this
+        # process is about to exit.
+        "pid": owner_pid,
+        "claimed_at": _iso(),
+        "expires_at": _iso(_now() + timedelta(seconds=lease_seconds)),
+    }
+    fresh.setdefault("history", []).append(
+        {"at": _iso(), "event": "claimed", "worker": worker})
+    _write_atomic(queue_dir() / ("%s.json" % fresh["id"]), fresh)
+    lock.unlink(missing_ok=True)
+    return fresh
+
+
+def cmd_queue(args):
+    cwd = str(Path(args.cwd or os.getcwd()).resolve())
+    sub = args.queue_cmd
+
+    if sub == "next":
+        reap_stale(cwd=cwd)
+        worker = args.worker or ("pid-%d" % os.getpid())
+        for candidate in all_queue_tasks(cwd=cwd, states=("pending",)):
+            got = _claim(candidate, worker, args.lease, owner_pid=args.owner_pid)
+            if got:
+                print(json.dumps(got, indent=2))
+                return 0
+        if args.json:
+            print(json.dumps({"task": None}))
+        else:
+            print("nothing pending for %s" % cwd)
+        return 0
+
+    if sub in ("done", "fail", "cancel"):
+        if not args.id:
+            die("which task? e.g. fleet queue %s <id>" % sub)
+        t = load_queue_task(args.id)
+        if not t:
+            die("no queued task %r" % args.id)
+        state = {"done": "done", "fail": "failed", "cancel": "cancelled"}[sub]
+        t["state"] = state
+        t["lease"] = None
+        t["finished"] = _iso()
+        if args.summary:
+            t["summary"] = args.summary
+        if args.error:
+            t["error"] = args.error
+        t.setdefault("history", []).append({"at": _iso(), "event": state})
+        _write_atomic(queue_dir() / ("%s.json" % t["id"]), t)
+        print("%s -> %s" % (t["id"], state))
+        if sub != "cancel":
+            notify("Fleet: task %s" % state,
+                   (args.summary or args.error or t.get("label") or t["prompt"])[:180])
+        return 0
+
+    if sub == "beat":
+        if not args.id:
+            die("which task?")
+        t = load_queue_task(args.id)
+        if not t or t.get("state") != "claimed":
+            die("task %r is not claimed" % args.id)
+        t["lease"]["expires_at"] = _iso(_now() + timedelta(seconds=args.lease))
+        _write_atomic(queue_dir() / ("%s.json" % t["id"]), t)
+        print("lease extended to %s" % t["lease"]["expires_at"])
+        return 0
+
+    if sub == "reap":
+        got = reap_stale(cwd=cwd, verbose=True)
+        print("reclaimed %d task(s)" % len(got))
+        return 0
+
+    if sub == "attach":
+        # One drainer per project. Holding the slot is proved by re-attaching
+        # each poll, not by a live pid: this process exits immediately, so a
+        # pid check would let a second controller straight in.
+        wf = worker_dir() / (_norm_path(cwd)[:120] + ".json")
+        me = args.worker or "foreground"
+        cur = None
+        try:
+            cur = json.loads(wf.read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        if cur and cur.get("session") != me and not args.force:
+            held = _worker_is_live(cur)
+            if held:
+                die("a worker is already attached to this project: %s (last seen %s).\n"
+                    "  It is already draining - starting a second one would run tasks twice.\n"
+                    "  Use --force only if it is wedged." % (cur.get("session"), cur.get("attached_at")))
+
+        _write_atomic(wf, {"pid": os.getpid(), "session": me, "owner_pid": args.owner_pid,
+                           "cwd": cwd, "attached_at": _iso(), "poll_seconds": args.poll})
+        print("attached to %s as %r" % (cwd, me))
+        print("  poll every %ds; re-attach each poll to hold the slot" % args.poll)
+        print("  drain loop:  /loop %dm fleet queue next --json" % max(1, args.poll // 60))
+        return 0
+
+    if sub == "status":
+        counts = {}
+        for t in all_queue_tasks(cwd=None if args.all else cwd):
+            counts[t.get("state", "?")] = counts.get(t.get("state", "?"), 0) + 1
+        print("queue: %s" % (", ".join("%s=%d" % kv for kv in sorted(counts.items())) or "empty"))
+        wf = worker_dir() / (_norm_path(cwd)[:120] + ".json")
+        if wf.is_file():
+            try:
+                w = json.loads(wf.read_text())
+                live = _worker_is_live(w)
+                print("worker: %s - %s (last seen %s, poll %ss)"
+                      % (w.get("session"),
+                         "holding the slot" if live
+                         else "stale, the slot is free to take",
+                         w.get("attached_at"), w.get("poll_seconds")))
+            except (OSError, json.JSONDecodeError):
+                pass
+        else:
+            print("worker: none attached (`fleet queue attach`)")
+        return 0
+
+    # list
+    states = None if args.all else ("pending", "claimed")
+    tasks = all_queue_tasks(cwd=None if args.all else cwd, states=states)
+    if not tasks:
+        print("nothing queued.  add one:  fleet enqueue \"...\"")
+        return 0
+    print("  %-22s %-9s %-4s %-8s %s" % ("ID", "STATE", "TRY", "PRIO", "LABEL / PROMPT"))
+    for t in tasks:
+        print("  %-22s %-9s %-4s %-8s %s" % (
+            t["id"], t.get("state"), t.get("attempts", 0), t.get("priority", 0),
+            (t.get("label") or " ".join(t.get("prompt", "").split()))[:46]))
+    return 0
+
+
 def cmd_adopt(args):
     """Pick up an existing project conversation from either CLI."""
     roster = load_roster()
@@ -1607,6 +1914,37 @@ def main():
     b.add_argument("--max-parallel", type=int)
     common(b)
     b.set_defaults(fn=cmd_batch)
+
+    eq = sub.add_parser("enqueue", help="add a task for the attached foreground session")
+    eq.add_argument("prompt")
+    eq.add_argument("--cwd")
+    eq.add_argument("--key", help="idempotency key (defaults to a hash of cwd + prompt)")
+    eq.add_argument("--kind", default="implement")
+    eq.add_argument("--complexity", default="medium", choices=COMPLEXITIES)
+    eq.add_argument("--priority", type=int, default=0, help="higher runs first")
+    eq.add_argument("--label", help="short name shown in listings and notifications")
+    eq.set_defaults(fn=cmd_enqueue)
+
+    q = sub.add_parser("queue", help="inspect and drain the foreground task queue")
+    q.add_argument("queue_cmd", nargs="?", default="list",
+                   choices=["list", "next", "done", "fail", "cancel", "beat",
+                            "reap", "attach", "status"])
+    q.add_argument("id", nargs="?")
+    q.add_argument("--cwd")
+    q.add_argument("--worker", help="name recorded as the claim owner")
+    q.add_argument("--owner-pid", type=int,
+                   help="a long-lived pid to watch; if it dies the claim is released "
+                        "immediately instead of waiting for the lease to expire")
+    q.add_argument("--lease", type=int, default=DEFAULT_LEASE_SECONDS,
+                   help="seconds a claim stays valid without a heartbeat")
+    q.add_argument("--poll", type=int, default=DEFAULT_POLL_SECONDS,
+                   help="seconds between polls (default %d)" % DEFAULT_POLL_SECONDS)
+    q.add_argument("--summary", help="what was done (shown in the notification)")
+    q.add_argument("--error", help="why it failed")
+    q.add_argument("--all", action="store_true", help="every project, every state")
+    q.add_argument("--force", action="store_true", help="take over a wedged worker slot")
+    q.add_argument("--json", action="store_true")
+    q.set_defaults(fn=cmd_queue)
 
     tk = sub.add_parser("task", help="branch -> receipt -> review -> understanding -> merge")
     tk.add_argument("task_cmd", choices=["start", "receipt", "review", "status", "list"])
