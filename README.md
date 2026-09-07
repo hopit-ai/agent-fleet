@@ -186,7 +186,10 @@ Three rules decide whether this works well:
 | `fleet route [--all]` | ask the policy which model fits |
 | `fleet run <prompt>` | delegate one task |
 | `fleet batch <plan.json>` | dependency-ordered parallel fan-out |
+| `fleet adopt` | list prior Claude Code / Codex sessions here; adopt or hand one off |
 | `fleet sessions` | list named sessions; `--forget NAME` / `--forget-all` |
+| `fleet task <cmd>` | branch → receipt → review → understanding → merge |
+| `fleet receipt` | write a notebook receipt for a run |
 | `fleet ledger [--show ID]` | past runs |
 
 Every run is recorded under `~/.fleet/runs/<timestamp>-<label>/` with the plan,
@@ -239,6 +242,67 @@ Under the hood: `claude --session-id/--resume` and `codex exec resume`. Session
 ids are recorded in `~/.fleet/sessions.json`; `fleet sessions --forget NAME`
 drops one. Forgetting a session doesn't delete the underlying conversation, it
 just stops fleet tracking it.
+
+## Picking up an existing project
+
+Both CLIs keep transcripts on disk. `fleet adopt` finds the ones for your current
+directory — from **either** CLI — so a project already in flight can be continued
+rather than re-explained:
+
+```bash
+fleet adopt
+```
+
+```
+  #   CLI     SESSION ID                             TURNS  UPDATED              TITLE
+  1   codex   01a06ade-18a3-7e71-a653-c79efc68b154   869    2026-09-07T04:53:53  Check project progress
+  2   claude  a38e921b-29f9-4919-b1bf-de00cddb6f4d   250    2026-09-07T04:36:02  Self-distillation papers review
+```
+
+```bash
+fleet adopt 01a06ade --as work                    # same CLI - resumes it for real
+fleet adopt a38e921b --as work --handoff terra    # other CLI - carries the transcript
+```
+
+A Claude session cannot literally be resumed inside Codex, so `--handoff` extracts
+the transcript, strips harness scaffolding (plugin lists, context blocks), budgets
+it to fit, and opens a fresh session on the target model seeded with it. The model
+replies with where the work stands before touching anything.
+
+The orchestrator skill runs `fleet adopt` at startup and asks you before assuming
+a project is new.
+
+## The task workflow
+
+For teams that want every change to arrive with evidence. `fleet task` enforces
+four gates and exits non-zero until all of them pass:
+
+```bash
+fleet task start add-rate-limiting     # cuts fleet/add-rate-limiting, refuses a dirty tree
+#   ... delegate the work as usual ...
+fleet task receipt add-rate-limiting   # attach the notebook receipt
+fleet task review  add-rate-limiting --verdict pass --by fable
+#   ... fill in .fleet/tasks/<slug>/understanding.md ...
+fleet task status  add-rate-limiting   # exit 0 only when all four are green
+```
+
+```
+  [x] branch         on fleet/add-rate-limiting
+  [x] receipt        receipt.ipynb (9 cells)
+  [x] review         pass by fable
+  [ ] understanding  88 chars of prose
+
+NOT ready to merge - open gates: understanding
+```
+
+**The receipt** is a real `.ipynb` (written as plain JSON — no notebook libraries
+needed) holding the goal, every delegation with its prompt and response, the
+branch and diffstat, and a verification cell for you to fill with what you
+actually ran. Every `fleet run` and `fleet batch` writes one automatically.
+
+**The understanding document** is prose for a person who was not there: what was
+asked, what changed, why this way, what could go wrong, how it was checked. The
+gate rejects an untouched template.
 
 ## Safety
 
