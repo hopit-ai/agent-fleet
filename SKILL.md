@@ -67,6 +67,28 @@ fleet doctor --auth
 with a 401 or an auth error — it tells you which side needs a re-login instead
 of leaving you guessing. Skip it on the happy path; it costs a round trip.
 
+### 1b. What to keep, and what to send away
+
+Delegations run **headless**. They do not open in your app, and the user cannot
+watch them happen. That shapes what belongs where:
+
+- **Keep in this conversation:** planning, research, weighing options, anything
+  where the user's judgement changes the outcome. These are decisions, and they
+  should be visible while they are being made.
+- **Send to workers:** implementation, tests, mechanical refactors, audits —
+  work with a definite goal that can be checked once it comes back.
+
+Every delegation leaves a real, openable session behind. `fleet run` and
+`fleet batch` print the command for each one:
+
+```
+ok   [haiku] b in 6.4s   open: claude --resume 7cb052d7-...
+ok   [spark] a in 7.2s   open: codex resume 01a07b9b-...
+```
+
+Pass those on when the user asks what a worker actually did — they can read the
+whole conversation. `fleet sessions` lists the same for named sessions.
+
 ### 2. Plan
 
 Break the goal into tasks. For each one decide two things:
@@ -84,6 +106,31 @@ fleet route --all                              # the whole matrix
 Override with `"model": "sol"` on a task when you have a reason. Good reasons:
 you want a specific family's strengths, you are deliberately getting a second
 opinion, or the user asked for a named model.
+
+### 2b. Carry your reasoning, not just your conclusions
+
+A delegate is a fresh process. It gets an instruction with no idea why. Put the
+settled decisions in the plan and they are prepended to every task:
+
+```json
+{
+  "goal": "Add rate limiting to the public API",
+  "context": "The API is behind a shared gateway; per-process limits would not hold.",
+  "decisions": [
+    "Token bucket, not a fixed window - bursts are expected and acceptable.",
+    "Limits live in config, not in code.",
+    "No new dependencies."
+  ],
+  "tasks": [ ... ]
+}
+```
+
+Workers are told these are settled, and told to **stop and say so** rather than
+silently choose differently if one turns out to be impossible. Set
+`"inherit_decisions": false` on a task that genuinely should not see them.
+
+Write down the constraints a reviewer would otherwise flag later. If you rejected
+an approach, say which and why — that is the part a delegate cannot reconstruct.
 
 ### 3. Write the plan file
 

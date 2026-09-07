@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 HERE = Path(__file__).resolve().parent
 FLEET_HOME = Path(os.environ.get("FLEET_HOME", Path.home() / ".fleet"))
@@ -114,15 +114,18 @@ def _message_text(obj, backend):
     return (pay["role"], text) if text else None
 
 
-def _scan_transcript(path, backend):
+def _scan_transcript(path, backend, stop_after_cwd=False):
     """One pass over a transcript: title, cwd, turn count, opening ask.
 
     Everything the listing needs comes from a single read - scanning again per
     session would double the I/O of `fleet adopt`, which runs at every startup.
+    `stop_after_cwd` is the cheap probe used to identify a directory.
     """
     title = cwd = first_ask = None
     turns = 0
     for obj in _jsonl(path):
+        if stop_after_cwd and cwd:
+            break
         if backend == "claude":
             t = obj.get("type")
             if t in ("custom-title", "ai-title"):
@@ -142,16 +145,52 @@ def _scan_transcript(path, backend):
     return {"title": title, "cwd": cwd, "turns": turns, "first_ask": first_ask}
 
 
+CLAUDE_DIR_TRUNCATE = 200
+
+
+def _claude_project_dirs(cwd):
+    """Directories that might hold sessions for this cwd.
+
+    Claude Code encodes a cwd by replacing non-alphanumerics with '-', but for
+    long paths it truncates to 200 characters and appends a short hash, so an
+    exact name match silently misses deep directories - worktrees and scratch
+    dirs especially. Candidates are matched loosely here and confirmed against
+    the cwd recorded inside the transcript.
+    """
+    if not CLAUDE_PROJECTS.is_dir():
+        return []
+    want = _norm_path(Path(cwd).resolve())
+    dirs = [d for d in CLAUDE_PROJECTS.iterdir() if d.is_dir()]
+
+    exact = [d for d in dirs if d.name == want]
+    if exact:
+        return exact
+    if len(want) > CLAUDE_DIR_TRUNCATE:
+        head = want[:CLAUDE_DIR_TRUNCATE]
+        truncated = [d for d in dirs if d.name.startswith(head)]
+        if truncated:
+            return truncated
+    # Last resort: the encoding changed. Ask the transcripts themselves.
+    target = Path(cwd).resolve()
+    matches = []
+    for d in dirs:
+        for f in d.glob("*.jsonl"):
+            rec = _scan_transcript(f, "claude", stop_after_cwd=True)["cwd"]
+            if rec:
+                try:
+                    if Path(rec).resolve() == target:
+                        matches.append(d)
+                except OSError:
+                    pass
+            break  # one file is enough to identify the directory
+    return matches
+
+
 def discover_claude_sessions(cwd):
     """Prior Claude Code sessions whose recorded cwd matches."""
-    want_dir = _norm_path(Path(cwd).resolve())
     want_cwd = Path(cwd).resolve()
     found = []
-    if not CLAUDE_PROJECTS.is_dir():
-        return found
-    for d in CLAUDE_PROJECTS.iterdir():
-        if not d.is_dir() or d.name != want_dir:
-            continue
+    for d in _claude_project_dirs(cwd):
         for f in d.glob("*.jsonl"):
             info = _scan_transcript(f, "claude")
             if info["cwd"]:
@@ -257,6 +296,19 @@ def transcript_digest(entry, max_chars=12000):
     return text
 
 
+def resume_hint(backend, native_id):
+    """The command that opens this worker's conversation interactively.
+
+    Delegations run headless, but they are real sessions in each CLI's own
+    store - so every one of them can be opened and read afterwards.
+    """
+    if not native_id:
+        return None
+    if backend == "claude":
+        return "claude --resume %s" % native_id
+    return "codex resume %s" % native_id
+
+
 def parse_codex_thread_id(stdout):
     """codex --json emits a thread.started event carrying the thread id."""
     for line in stdout.splitlines():
@@ -347,6 +399,34 @@ def validate_task_ids(tasks):
         seen.add(key)
 
 
+def decisions_block(plan):
+    """Carry the orchestrator's reasoning to the workers, not just its conclusions.
+
+    A delegate is a fresh process: without this it receives an instruction with
+    no rationale, which is how delegated work drifts from what was intended.
+    """
+    parts = []
+    context = str(plan.get("context") or "").strip()
+    if context:
+        parts.append("## Background\n\n" + context)
+
+    decisions = plan.get("decisions") or []
+    if isinstance(decisions, str):
+        decisions = [decisions]
+    items = [str(d).strip() for d in decisions if str(d).strip()]
+    if items:
+        parts.append(
+            "## Decisions already made\n\n"
+            "These are settled. Work within them rather than re-opening them. If one "
+            "turns out to be impossible, stop and say so instead of quietly choosing "
+            "something else.\n\n" + "\n".join("- " + i for i in items))
+
+    if not parts:
+        return ""
+    return ("# Context from the orchestrator\n\n" + "\n\n".join(parts)
+            + "\n\n---\n\n# Your task\n\n")
+
+
 def validate_plan(plan):
     """Check a plan's shape, fill in default ids, and return its tasks.
 
@@ -358,6 +438,10 @@ def validate_plan(plan):
     tasks = plan.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise ValueError('plan needs a non-empty "tasks" array (see examples/ in the repo)')
+    if "decisions" in plan and not isinstance(plan["decisions"], (list, str)):
+        raise ValueError('plan "decisions" must be a list of strings (or one string)')
+    if "context" in plan and not isinstance(plan["context"], str):
+        raise ValueError('plan "context" must be a string')
     for i, t in enumerate(tasks):
         if not isinstance(t, dict):
             raise ValueError("task %d must be an object, got %s" % (i + 1, type(t).__name__))
@@ -671,12 +755,18 @@ def run_task(roster, task, run_dir, cwd, timeout, yolo, prefer, verbose=False):
 
     result["session"] = sess_name
     result["resumed"] = resumed
+
+    # Every delegation leaves a real session behind; record its id so the
+    # conversation can be opened later, named session or not.
+    if model["backend"] == "claude":
+        native = (result.get("meta") or {}).get("session_id")
+    else:
+        native = parse_codex_thread_id(stdout)
+    native = native or (session or {}).get("native_id")
+    result["native_id"] = native
+    result["resume_with"] = resume_hint(model["backend"], native)
+
     if session is not None:
-        native = session.get("native_id")
-        if model["backend"] == "claude":
-            native = (result.get("meta") or {}).get("session_id") or native
-        else:
-            native = parse_codex_thread_id(stdout) or native
         if native and result["ok"]:
             session["native_id"] = native
             session["turns"] = session.get("turns", 0) + 1
@@ -859,6 +949,8 @@ def cmd_run(args):
             tag = "  [session %s%s]" % (res["session"], ", resumed" if res.get("resumed") else ", new")
         print("\n--- %s via %s (%s, %ss)%s ---" % (res["id"], res["model"], res["backend"], res["seconds"], tag))
         print(res["output"])
+        if res.get("resume_with"):
+            print("\nopen this conversation:  %s" % res["resume_with"], file=sys.stderr)
         if not res["ok"]:
             print("\n[FAILED rc=%s] %s" % (res["exit_code"], res.get("stderr", "")), file=sys.stderr)
     print("\nledger: %s" % run_dir, file=sys.stderr)
@@ -873,6 +965,16 @@ def cmd_batch(args):
         tasks = validate_plan(plan)
     except ValueError as e:
         die(str(e))
+    preamble = decisions_block(plan)
+    if preamble:
+        carried = 0
+        for t in tasks:
+            if t.get("inherit_decisions", True):
+                t["prompt"] = preamble + t["prompt"]
+                carried += 1
+        print("fleet: carrying the orchestrator's context into %d of %d task(s)"
+              % (carried, len(tasks)), file=sys.stderr)
+
     run_dir = new_run_dir(plan.get("label", "batch"))
     Path(run_dir, "plan.json").write_text(json.dumps(plan, indent=2))
 
@@ -898,10 +1000,14 @@ def cmd_batch(args):
                 r = f.result()
                 prior[r["id"]] = r
                 results.append(r)
-                print("  %s [%s] %s in %ss" % ("ok  " if r["ok"] else "FAIL",
-                                               r["model"], r["id"], r["seconds"]), file=sys.stderr)
+                print("  %s [%s] %s in %ss%s" % (
+                    "ok  " if r["ok"] else "FAIL", r["model"], r["id"], r["seconds"],
+                    ("   open: " + r["resume_with"]) if r.get("resume_with") else ""),
+                    file=sys.stderr)
 
-    summary = {"cwd": cwd, "goal": plan.get("goal"), "run_dir": str(run_dir), "results": results}
+    summary = {"cwd": cwd, "goal": plan.get("goal"), "run_dir": str(run_dir),
+               "context": plan.get("context"), "decisions": plan.get("decisions"),
+               "results": results}
     Path(run_dir, "run.json").write_text(json.dumps(summary, indent=2))
     rec = write_receipt(summary, run_dir, cwd)
     if rec:
@@ -987,6 +1093,17 @@ def build_receipt(summary, git_info=None):
             % (git_info.get("branch", "?"), git_info.get("head", "?"),
                _fence(git_info.get("diffstat") or "(no uncommitted changes)"))))
 
+    decisions = summary.get("decisions") or []
+    if isinstance(decisions, str):
+        decisions = [decisions]
+    if summary.get("context") or decisions:
+        body = ""
+        if summary.get("context"):
+            body += str(summary["context"]).strip() + "\n\n"
+        if decisions:
+            body += "\n".join("- " + str(d).strip() for d in decisions if str(d).strip())
+        cells.append(_nb_md("## Decisions carried into this work\n\n" + body + "\n"))
+
     cells.append(_nb_md("## Delegations\n\nOne section per task, in completion order."))
     for r in results:
         cells.append(_nb_md(
@@ -995,12 +1112,14 @@ def build_receipt(summary, git_info=None):
             "| model | `%s` (`%s`) |\n| backend | %s |\n| tier | %s |\n"
             "| kind / complexity | %s / %s |\n| read-only | %s |\n"
             "| session | %s |\n| duration | %ss |\n| result | %s |\n"
+            "| open the conversation | %s |\n"
             % (r.get("id"), "ok" if r.get("ok") else "FAILED",
                r.get("model"), r.get("model_id"), r.get("backend"), r.get("tier"),
                r.get("kind") or "-", r.get("complexity") or "-",
                "yes" if r.get("readonly") else "no",
                r.get("session") or "-", r.get("seconds"),
-               "success" if r.get("ok") else "exit %s" % r.get("exit_code"))))
+               "success" if r.get("ok") else "exit %s" % r.get("exit_code"),
+               ("`%s`" % r["resume_with"]) if r.get("resume_with") else "-")))
         if r.get("prompt"):
             cells.append(_nb_md("**Prompt sent**\n\n" + _fence(r["prompt"])))
         cells.append(_nb_md("**Response**\n\n"
@@ -1410,12 +1529,14 @@ def cmd_sessions(args):
               "Start one:  fleet run \"...\" --session mywork --cwd /path/to/repo")
         return 0
 
-    print("%-14s %-8s %-7s %-6s %-20s %s" % ("NAME", "MODEL", "BACKEND", "TURNS", "LAST USED", "CWD"))
+    print("%-14s %-8s %-7s %-6s %-20s %s" % ("NAME", "MODEL", "BACKEND", "TURNS", "LAST USED", "OPEN WITH"))
     for name, sess in sorted(data.items()):
+        hint = resume_hint(sess.get("backend"), sess.get("native_id")) or "-"
         print("%-14s %-8s %-7s %-6s %-20s %s" % (
             name[:14], sess.get("model", "?"), sess.get("backend", "?"),
-            sess.get("turns", 0), (sess.get("last_used") or "-")[:19], sess.get("cwd", "?")))
-    print("\nResume:  fleet run \"next instruction\" --session <NAME>")
+            sess.get("turns", 0), (sess.get("last_used") or "-")[:19], hint))
+    print("\nContinue headless:  fleet run \"next instruction\" --session <NAME>")
+    print("Read it yourself:   run the OPEN WITH command above")
     return 0
 
 
