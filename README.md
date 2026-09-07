@@ -11,9 +11,9 @@ each piece to whichever model actually fits it — *on either backend* — revie
 what comes back, and escalates when something fails.
 
 ```
-   Claude Code  ──┐                    ┌──►  claude -p   ──►  opus · sonnet · haiku
-                  ├──►   fleet   ──────┤
-   Codex        ──┘                    └──►  codex exec  ──►  sol · terra · luna · mini · spark
+   Claude Code (fable)  ──┐                ┌──►  claude -p   ──►  opus · sonnet · haiku
+                          ├──►  fleet  ────┤
+   Codex (astra)        ──┘                └──►  codex exec  ──►  sol · terra · luna · mini · spark
 ```
 
 No daemon, no server, no SDK. `fleet` is a single dependency-free Python script
@@ -21,7 +21,7 @@ that shells out to CLIs you already have.
 
 ## Why
 
-Three things fall out of this that you don't get from one model in one app:
+Several things fall out of this that you don't get from one model in one app:
 
 - **Cost and latency, graded.** Renames, boilerplate and changelog entries go to
   a small fast model. Concurrency bugs and data-correctness work go to a big one.
@@ -201,12 +201,12 @@ Three rules decide whether this works well:
 | `fleet batch <plan.json>` | dependency-ordered parallel fan-out |
 | `fleet adopt` | list prior Claude Code / Codex sessions here; adopt or hand one off |
 | `fleet sessions` | list named sessions; `--forget NAME` / `--forget-all` |
-| `fleet task <cmd>` | branch → receipt → review → understanding → merge |
+| `fleet task start\|receipt\|review\|status\|list` | the gated task workflow |
 | `fleet receipt` | write a notebook receipt for a run |
 | `fleet ledger [--show ID]` | past runs |
 
 Every run is recorded under `~/.fleet/runs/<timestamp>-<label>/` with the plan,
-each task's JSON result, and raw output.
+each task's JSON result, the raw final message, and a `receipt.ipynb`.
 
 ## Named sessions
 
@@ -320,6 +320,19 @@ actually ran. Every `fleet run` and `fleet batch` writes one automatically.
 asked, what changed, why this way, what could go wrong, how it was checked. The
 gate rejects an untouched template.
 
+Both live in the repo, next to the code they describe:
+
+```
+.fleet/tasks/<slug>/
+├── task.json          branch, base, and the recorded review verdict
+├── receipt.ipynb      what was delegated and what came back
+└── understanding.md   the plain-language write-up
+```
+
+**Commit them.** They are the evidence for the change, and they are worth more in
+the history than in a scratch directory. `fleet task start` deliberately ignores
+these files when it checks for a dirty tree, so they never block the next task.
+
 ## Safety
 
 Delegates are sandboxed by default and scoped to the task's `cwd`:
@@ -328,6 +341,16 @@ Delegates are sandboxed by default and scoped to the task's `cwd`:
 `--yolo`**. `--yolo` removes the sandbox entirely — opt in deliberately.
 
 `fleet` itself makes no network calls; the CLIs it invokes do.
+
+`fleet adopt` reads your **local** session transcripts — `~/.claude/projects` and
+`~/.codex/sessions` — to find prior work in the current directory. Nothing is sent
+anywhere by that command. A `--handoff`, though, puts the selected transcript into
+a prompt for the target model, so treat it like any other prompt: it goes to that
+provider. Check what you are sending first with:
+
+```bash
+fleet adopt <id> --digest-only
+```
 
 ## Configuration
 
@@ -340,6 +363,12 @@ Delegates are sandboxed by default and scoped to the task's `cwd`:
 Roster lookup order: `$FLEET_ROSTER`, `./.fleet/roster.json`,
 `$FLEET_HOME/roster.json`, then the copy beside the script — so a repo can carry
 its own routing policy.
+
+| Path | Holds |
+|---|---|
+| `~/.fleet/runs/<run>/` | per-run plan, results, raw output, receipt |
+| `~/.fleet/sessions.json` | named sessions and their native session ids |
+| `<repo>/.fleet/tasks/<slug>/` | task metadata, receipt, understanding doc |
 
 ## A note on model names
 
